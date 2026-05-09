@@ -13,9 +13,11 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+from pathlib import Path
 import secrets
 from secrets import token_bytes
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -26,11 +28,15 @@ log = logging.getLogger(__name__)
 # ── constants ─────────────────────────────────────────────────────────
 
 DEFAULT_BASE_URL = os.environ.get("WEIXIN_BASE_URL", "https://ilinkai.weixin.qq.com")
+DEFAULT_CDN_BASE_URL = os.environ.get(
+    "WEIXIN_CDN_BASE_URL",
+    "https://novac2c.cdn.weixin.qq.com/c2c",
+)
 ILINK_APP_ID = os.environ.get("WEIXIN_ILINK_APP_ID", "bot")
 
 # Mirror the upstream plugin version so the server-side client-version gate
 # behaves the same. Bump when the iLink protocol changes materially.
-CLIENT_VERSION_STR = "2.1.8"
+CLIENT_VERSION_STR = "2.1.8"  # mirror npm openclaw-weixin; "1.0.0" 直接 CDN 404
 CLIENT_VERSION_INT = (
     ((int(CLIENT_VERSION_STR.split(".")[0]) & 0xFF) << 16)
     | ((int(CLIENT_VERSION_STR.split(".")[1]) & 0xFF) << 8)
@@ -290,7 +296,7 @@ class WeixinClient:
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.account_id = account_id
-        self.cdn_base_url = (cdn_base_url or base_url).rstrip("/")
+        self.cdn_base_url = (cdn_base_url or DEFAULT_CDN_BASE_URL).rstrip("/")
         self._paused_until: float = 0.0
 
     # ── session pause ────────────────────────────────────────────────
@@ -473,6 +479,7 @@ class WeixinClient:
         Output dict:
             encrypt_query_param: str   # put into CDNMedia.encrypt_query_param
             aes_key: str               # base64(hex) — put into CDNMedia.aes_key
+            full_url: str              # CDN download URL for clients that need it
             raw_size: int              # plaintext bytes
             cipher_size: int           # ciphertext bytes
             md5: str                   # plaintext hex md5
@@ -513,6 +520,10 @@ class WeixinClient:
         return {
             "encrypt_query_param": download_param,
             "aes_key": encode_outbound_aes_key(key),
+            "full_url": (
+                f"{self.cdn_base_url}/download"
+                f"?encrypted_query_param={quote(download_param, safe='')}"
+            ),
             "raw_size": rawsize,
             "cipher_size": filesize,
             "md5": md5,
@@ -642,5 +653,29 @@ def file_item(uploaded: dict[str, Any], file_name: str) -> dict[str, Any]:
             "file_name": file_name,
             "md5": uploaded["md5"],
             "len": str(uploaded["raw_size"]),
+        },
+    }
+
+
+def voice_item(uploaded: dict[str, Any], *, playtime: int = 0, **_unused: Any) -> dict[str, Any]:
+    """[NOT REACHABLE — see weixin_mcp.py / weixin_bridge.py 同名 verdict]
+
+    2026-04-26 round 2 verdict 实证: ilink server silent filter bot→user voice.
+    保留函数仅为 import 不破裂; wx_send_voice MCP tool 已下线, _handle_send_voice
+    fail-fast 兜底, 这里不会被调到. 字段是 Java SDK live wire dump 实测值
+    (encode_type=7, playtime, sample_rate=24000, media has 3 fields) — 即使将来
+    协议放开重启探索, 这是已知最贴近的起点. 实证证据见
+    `~/cc-workspace/memory/feedback_ilink_voice_send_blocked.md`.
+    """
+    media = _media_ref(uploaded)
+    if uploaded.get("full_url"):
+        media["full_url"] = uploaded["full_url"]
+    return {
+        "type": ITEM_VOICE,
+        "voice_item": {
+            "media": media,
+            "encode_type": 7,
+            "playtime": int(playtime or 0),
+            "sample_rate": 24000,
         },
     }

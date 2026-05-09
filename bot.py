@@ -35,7 +35,7 @@ load_dotenv(override=False)
 # Namespace / paths derive from PROJECT_NAMESPACE + BABATA_INSTANCE env.
 # See constants.py for the full derivation. Propagate BRIDGE_SOCKET to
 # bridge.py (imported next) and to tg_mcp subprocess below.
-from constants import BRIDGE_SOCKET, INSTANCE, INSTANCE_LABELS, PROJECT, SESSION_FILE, STATE_DIR, STATE_FILE
+from constants import BRIDGE_SOCKET, INSTANCE, INSTANCE_LABELS, LAUNCHD_PREFIX, PROJECT, SESSION_FILE, STATE_DIR, STATE_FILE
 os.environ["BABATA_BRIDGE_SOCKET"] = BRIDGE_SOCKET
 
 from telegram import Update
@@ -60,7 +60,55 @@ log = logging.getLogger(PROJECT)
 
 _TG_MCP_SCRIPT = str(Path(__file__).parent / "tg_mcp.py")
 
-_TG_SOURCE_PROMPT = "Source: Telegram."
+# ── Idempotency: TG update_id 持久化 (无感重启) ────────────────────────
+# drop_pending_updates=False → TG 重交付未 ack 的 update; 入口 _processed_set
+# 命中跳过 (不重做); turn 完整结束 (jsonl ResultMessage 收尾) 后落盘标 done.
+# 边界 case: turn 完成但落盘前崩溃 → 重启重做 turn + 重发 reply (毫秒窗口,
+# 物理无解, V "做到物理极限就行").
+PROCESSED_UPDATES_FILE = STATE_DIR / f"processed-updates-{INSTANCE}.json"
+_PROCESSED_MAX = 1000  # 滚动窗口
+
+def _load_processed() -> set[int]:
+    if not PROCESSED_UPDATES_FILE.exists():
+        return set()
+    try:
+        import json as _json
+        return set(_json.loads(PROCESSED_UPDATES_FILE.read_text()).get("done", []))
+    except Exception as e:
+        log.warning("processed-updates load failed: %s, treating as empty", e)
+        return set()
+
+_processed_lock = asyncio.Lock()
+_processed_set: set[int] = _load_processed()  # 模块加载即填充 (sync read)
+
+async def _mark_processed(update_id: int | None) -> None:
+    if update_id is None:
+        return
+    async with _processed_lock:
+        if update_id in _processed_set:
+            return
+        _processed_set.add(update_id)
+        if len(_processed_set) > _PROCESSED_MAX:
+            keep = sorted(_processed_set, reverse=True)[:_PROCESSED_MAX]
+            _processed_set.clear()
+            _processed_set.update(keep)
+        try:
+            import json as _json
+            tmp = PROCESSED_UPDATES_FILE.with_suffix(".json.partial")
+            tmp.write_text(_json.dumps({"done": sorted(_processed_set)}, indent=2))
+            os.replace(tmp, PROCESSED_UPDATES_FILE)
+        except Exception as e:
+            log.warning("processed-updates write failed: %s", e)
+
+
+_TG_SOURCE_PROMPT = (
+    "Source: Telegram. "
+    "Output Markdown (bot auto-converts to HTML subset: b/i/u/s/code/pre/a/blockquote). "
+    "Markdown headings/tables/hr unsupported. "
+    "iOS system font: prefer █/░ for progress bars; ▓ renders as noisy stipple. "
+    "New bubble: separate paragraphs with three newlines (\\n\\n\\n). "
+    "Max 4096 chars/message."
+)
 
 cc = LiveSession(
     state_file=SESSION_FILE,
@@ -103,6 +151,45 @@ async def _wait_inflight_drain(poll: float = 0.5) -> None:
         await asyncio.sleep(poll)
 
 
+# ── Restart reason channel (file-based, one-shot) ─────────────────────
+# 触发重启的外部脚本 (auto-update / babata-daily-restart / self-ops /
+# poll-healthcheck) 在 kickstart/kill 前向 STATE_DIR/restart-reason-{LABEL}.txt
+# 写一行 reason. 本进程在两处消费它 (各自 read+unlink, 一次性):
+#   1) graceful shutdown (SIGTERM 路径) → 拼到 "重启中..." TG alert
+#   2) 进程 startup → 拼到 "上线" alert (兜底 SIGKILL 路径, graceful 没跑过)
+# 任一路径读到都 unlink, 双重报告自然不发生 (file 只存在到第一次读).
+# 没文件 = 未指定原因 (KeepAlive 自动拉起 / 异常 crash / 人工 launchctl).
+def _self_launchd_label() -> str:
+    return f"{LAUNCHD_PREFIX}.{INSTANCE}" if INSTANCE else LAUNCHD_PREFIX
+
+
+def _pop_restart_reason() -> str | None:
+    """Atomic rename-then-read: SIGKILL between read and unlink would otherwise
+    leave a stale file that the next startup mis-attributes. By renaming to a
+    sibling .consumed path *first*, any crash after rename leaves nothing at
+    the canonical path for the next pop to pick up.
+    """
+    reason_file = STATE_DIR / f"restart-reason-{_self_launchd_label()}.txt"
+    consumed = reason_file.with_name(reason_file.name + ".consumed")
+    try:
+        os.replace(reason_file, consumed)
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        log.warning("rename restart-reason failed: %s", e)
+        return None
+    try:
+        reason = consumed.read_text(encoding="utf-8").strip()
+    except Exception as e:
+        log.warning("read consumed restart-reason failed: %s", e)
+        reason = None
+    try:
+        consumed.unlink()
+    except Exception as e:
+        log.warning("unlink consumed restart-reason failed: %s", e)
+    return reason or None
+
+
 async def _graceful_shutdown(app: "Application", reason: str) -> None:
     """Wait for the live turn, notify V via TG, then exit."""
     global _shutdown_requested
@@ -112,11 +199,16 @@ async def _graceful_shutdown(app: "Application", reason: str) -> None:
     _shutdown_requested = True
     log.info("Graceful shutdown requested: %s (in_flight=%d)", reason, _in_flight)
 
+    # One-shot read: external trigger 写的具体原因 (e.g. SDK 升级版本号).
+    # 没文件 → 未指定 (KeepAlive 拉起 / 人工 launchctl). startup alert 也读
+    # 同一路径, 但本路径先 unlink 后, 进程死前的 startup 不会再读到.
+    trigger = _pop_restart_reason() or "未指定 (KeepAlive 拉起 / 异常 / 人工 launchctl)"
+
     if _in_flight > 0 and ALLOWED_USER:
         try:
             await app.bot.send_message(
                 ALLOWED_USER,
-                f"[{_CURRENT_LABEL}] {reason} · 等 {_in_flight} 个任务跑完再重启",
+                f"[{_CURRENT_LABEL}] {reason} ({trigger}) · 等 {_in_flight} 个任务跑完再重启",
             )
         except Exception as e:
             log.warning("Pre-shutdown notice failed: %s", e)
@@ -133,7 +225,7 @@ async def _graceful_shutdown(app: "Application", reason: str) -> None:
         try:
             await app.bot.send_message(
                 ALLOWED_USER,
-                f"[{_CURRENT_LABEL}] 重启中... (launchd 自愈, ~10s 回来)",
+                f"[{_CURRENT_LABEL}] 重启中... ({trigger}, ~10s 回来)",
             )
         except Exception as e:
             log.warning("Shutdown notice failed: %s", e)
@@ -234,7 +326,20 @@ _last_session_id: str | None = _state.get("last_session_id")
 
 # ── Formatting (physical: TG requires HTML, max 4096 chars) ──────────
 
+# 4000 not 4096: leaves headroom for HTML entity expansion (`&` → `&amp;`)
+# and the (1/N) chunk indicator suffix added by `_split`.
 _MAX_TG = 4000
+
+# Stream edit throttle bases (seconds). adaptive backoff in `_handle_text_delta`
+# / `_handle_tool_event` doubles the interval on every flood-control failure
+# up to _MAX_EDIT_INTERVAL; reset to base on a successful edit.
+_TEXT_EDIT_INTERVAL_BASE = 2.0
+_TOOL_EDIT_INTERVAL_BASE = 2.0
+_MAX_EDIT_INTERVAL = 10.0
+# Hermes uses 3 strikes (`stream_consumer.py:_MAX_FLOOD_STRIKES`); same default
+# here. After N consecutive flood failures we stop trying to edit and let
+# turn-end's `_deliver_response` send the rest as a fresh reply_text.
+_MAX_FLOOD_STRIKES = 3
 
 _TOOL_EMOJI = {
     "Bash": "\U0001f4bb",           # 💻 terminal
@@ -305,11 +410,21 @@ def _to_html(md: str) -> str:
         )
     text = re.sub(r"```(\w*)\n(.*?)```", _save_code, md, flags=re.DOTALL)
 
-    # 1b. Pre-existing TG-compatible HTML tags that have no markdown equivalent.
-    # Users / CC may write them directly; we park them so the later
-    # html.escape doesn't turn `<u>` into `&lt;u&gt;`. Single-level only
-    # (no nested tag parsing) — adequate for chat.
-    for _raw_tag in ("u", "ins", "tg-spoiler"):
+    # 1b. Pre-existing TG-compatible HTML inline tags. CC may write them
+    # directly (e.g. `<b>核心</b>` instead of `**核心**`); we park them so
+    # later `html.escape` doesn't turn `<b>` into `&lt;b&gt;` (which TG
+    # would render as literal text — exactly the bug V hit 2026-05-06).
+    # Single-level only (no nested tag parsing) — adequate for chat.
+    # Order matters: longer tag names first so `<strong>` matches before
+    # the regex would otherwise try `<s>` on the same span.
+    # Keep `u/ins/tg-spoiler` (no markdown equivalent) + add `b/strong/
+    # i/em/s/strike/del/code` (have markdown equivalent but model may
+    # emit raw HTML directly).
+    _RAW_TAGS = (
+        "tg-spoiler", "strong", "strike", "code", "ins", "del",
+        "em", "b", "i", "s", "u",
+    )
+    for _raw_tag in _RAW_TAGS:
         def _make_raw_saver(t: str):
             def _save(m: re.Match) -> str:
                 return _park(f"<{t}>{html.escape(m.group(1))}</{t}>")
@@ -368,24 +483,179 @@ def _to_html(md: str) -> str:
     return text.strip()
 
 
+def _utf16_len(s: str) -> int:
+    """UTF-16 code-unit count.
+
+    Telegram measures the 4096 message limit in UTF-16 code units, not Unicode
+    code-points: emoji / CJK Extension B / surrogate-pair characters consume
+    2 units each even though Python `len()` counts them as 1. Hermes pattern,
+    ported from `gateway/platforms/base.py:utf16_len`.
+    """
+    return len(s.encode("utf-16-le")) // 2
+
+
+def _utf16_to_cp(s: str, budget: int) -> int:
+    """Largest codepoint offset n where utf16_len(s[:n]) <= budget. Binary search."""
+    if _utf16_len(s) <= budget:
+        return len(s)
+    lo, hi = 0, len(s)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _utf16_len(s[:mid]) <= budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
 def _split(text: str) -> list[str]:
-    """Split long message at newlines with chunk indicators."""
-    if len(text) <= _MAX_TG:
+    """Split long message at safe boundaries, UTF-16 aware.
+
+    Borrows hermes pattern (`gateway/platforms/base.py:truncate_message`):
+      - Measures length in UTF-16 (TG's wire unit, not codepoints)
+      - Closes/reopens ``` code blocks across chunks (`carry_lang`)
+      - Avoids splitting inside inline backtick spans (parity check)
+      - Appends `(1/N)` indicators when split
+
+    Single message ≤ 4096 wire units returns unchanged. The HTML produced by
+    `_to_html` survives this (block placeholders are already restored before
+    `_split` runs, so no html-aware logic needed here — only markdown fences).
+    """
+    if _utf16_len(text) <= _MAX_TG:
         return [text]
+
+    INDICATOR_RESERVE = 10  # " (XX/XX)"
+    FENCE_CLOSE = "\n```"
+
     parts: list[str] = []
     remaining = text
+    carry_lang: str | None = None  # set when previous chunk ended mid-code-block
+
     while remaining:
-        if len(remaining) <= _MAX_TG:
-            parts.append(remaining)
+        prefix = f"```{carry_lang}\n" if carry_lang is not None else ""
+        headroom = _MAX_TG - INDICATOR_RESERVE - _utf16_len(prefix) - _utf16_len(FENCE_CLOSE)
+        if headroom < 1:
+            headroom = _MAX_TG // 2
+
+        if _utf16_len(prefix) + _utf16_len(remaining) <= _MAX_TG - INDICATOR_RESERVE:
+            parts.append(prefix + remaining)
             break
-        idx = remaining.rfind("\n", 0, _MAX_TG)
-        if idx == -1:
-            idx = _MAX_TG
-        parts.append(remaining[:idx])
-        remaining = remaining[idx:].lstrip("\n")
+
+        cp_limit = _utf16_to_cp(remaining, headroom)
+        # Defensive: if a single character (e.g. surrogate-pair emoji) exceeds
+        # headroom, _utf16_to_cp returns 0. Without this floor we'd emit empty
+        # chunks and infinite-loop. Force at least 1 codepoint progress; the
+        # resulting chunk overflows budget by ≤1 unit, which TG accepts (the
+        # 4096 limit has slack vs our 4000 _MAX_TG). Codex round-1 caught.
+        if cp_limit < 1:
+            cp_limit = 1
+        region = remaining[:cp_limit]
+        split_at = region.rfind("\n")
+        if split_at < cp_limit // 2:
+            split_at = region.rfind(" ")
+        if split_at < 1:
+            split_at = cp_limit
+
+        # HTML attribute-space protection (round-2 follow-up): _to_html emits
+        # `<code class="language-python">` with spaces *inside* the opening
+        # tag. The space-rfind above can land at the space between `<code`
+        # and `class=`, producing a 5-char fragment '<code' followed by a
+        # malformed continuation. If split_at falls inside an unclosed
+        # `<...>` (last `<` after last `>` before split_at), back off to
+        # before that `<`.
+        last_lt = remaining.rfind("<", 0, split_at)
+        last_gt = remaining.rfind(">", 0, split_at)
+        if last_lt > last_gt and last_lt >= 1:
+            split_at = last_lt
+
+        # Inline backtick parity: don't split inside `code` (would orphan tick).
+        candidate = remaining[:split_at]
+        bt_count = candidate.count("`") - candidate.count("\\`")
+        if bt_count % 2 == 1:
+            last_bt = candidate.rfind("`")
+            while last_bt > 0 and candidate[last_bt - 1] == "\\":
+                last_bt = candidate.rfind("`", 0, last_bt)
+            if last_bt > 0:
+                safe_split = max(candidate.rfind(" ", 0, last_bt), candidate.rfind("\n", 0, last_bt))
+                if safe_split > cp_limit // 4:
+                    split_at = safe_split
+
+        # HTML <pre>/<code> tag pairing (Codex round-1 fix 4a, refined round-2):
+        # _to_html converts ``` fences to `<pre><code class="language-X">...</code></pre>`
+        # (with class attribute), and inline backticks to `<code>...</code>`.
+        # Naive split mid-tag → malformed HTML → TG plain-text fallback or 400.
+        # Back the split off to before any unclosed open tag.
+        #
+        # Open-tag matching uses the prefix `<code` (no `>`) to catch BOTH
+        # bare `<code>` AND class-attributed `<code class="...">` — Codex
+        # round-2 caught that bare `<code>` prefix missed the class form.
+        # `<pre>` has no class form in `_to_html`, so exact match suffices.
+        #
+        # Limitation: when the unclosed opener sits at offset 0 of the
+        # candidate, no backoff is possible (can't split below 0). The
+        # chunk emits malformed HTML and TG falls back to plain-text
+        # rendering — visually degraded, not a hard failure.
+        candidate = remaining[:split_at]
+        for open_pattern, close_tag in (("<pre>", "</pre>"), ("<code", "</code>")):
+            opens = candidate.count(open_pattern)
+            closes = candidate.count(close_tag)
+            if opens > closes:
+                pos = candidate.rfind(open_pattern)
+                if pos >= 1:
+                    safe = max(candidate.rfind("\n", 0, pos), candidate.rfind(" ", 0, pos))
+                    split_at = safe if safe > cp_limit // 4 else pos
+                    candidate = remaining[:split_at]
+
+        chunk_body = remaining[:split_at]
+        remaining = remaining[split_at:].lstrip("\n")
+        full_chunk = prefix + chunk_body
+
+        # Walk chunk_body to determine whether we end mid-fence.
+        in_code = carry_lang is not None
+        lang = carry_lang or ""
+        for line in chunk_body.split("\n"):
+            stripped = line.strip()
+            if stripped.startswith("```"):
+                if in_code:
+                    in_code = False
+                    lang = ""
+                else:
+                    in_code = True
+                    tag = stripped[3:].strip()
+                    lang = tag.split()[0] if tag else ""
+
+        if in_code:
+            full_chunk += FENCE_CLOSE
+            carry_lang = lang
+        else:
+            carry_lang = None
+
+        parts.append(full_chunk)
+
     if len(parts) > 1:
-        parts = [f"{p}\n\n({i+1}/{len(parts)})" for i, p in enumerate(parts)]
+        total = len(parts)
+        parts = [f"{p} ({i + 1}/{total})" for i, p in enumerate(parts)]
     return parts
+
+
+def _format_bubble_parts(text: str) -> tuple[list[str], str | None]:
+    """Return TG-safe message chunks plus parse_mode.
+
+    Telegram rejects malformed HTML, and `_split()` is intentionally plain-text
+    oriented. For long bubbles, prefer reliable plain delivery over trying to
+    split rendered HTML across tag boundaries.
+    """
+    bubble = text.strip()
+    if not bubble:
+        return [], None
+    html_text = _to_html(bubble)
+    if html_text and _utf16_len(html_text) <= _MAX_TG:
+        return [html_text], "HTML"
+    return _split(bubble), None
+
+
+def _parse_kwargs(parse_mode: str | None) -> dict[str, str]:
+    return {"parse_mode": parse_mode} if parse_mode else {}
 
 
 # ── Auth (physical: access control) ──────────────────────────────────
@@ -397,12 +667,24 @@ def _allowed(update: Update) -> bool:
     return bool(update.effective_user and update.effective_user.id == ALLOWED_USER)
 
 
+async def _callback_allowed(query: Any) -> bool:
+    """Authorize callback-query handlers before they mutate bot state."""
+    user = getattr(query, "from_user", None)
+    if ALLOWED_USER and user and getattr(user, "id", None) == ALLOWED_USER:
+        return True
+    if query is not None:
+        with suppress(Exception):
+            await query.answer("auth denied")
+    return False
+
+
 @dataclass
 class Payload:
     update: Update
     ctx: ContextTypes.DEFAULT_TYPE
     text: str
     images: list[dict[str, str]] | None = None
+    update_id: int | None = None  # idempotency: turn end 时 _mark_processed
 
 
 class ChannelWorker:
@@ -427,12 +709,30 @@ class ChannelWorker:
         self._text_message: Any | None = None
         self._text_buffer = ""
         self._text_last_edit = 0.0
+        self._streamed_bubble_count = 0
+        self._stale_text_messages: list[Any] = []
+        # Flood-control state per stream lane (text + tool). Hermes pattern
+        # (`stream_consumer.py:943-976`): on edit() failure, classify as flood
+        # / non-flood; flood → adaptive backoff (×2, cap 10s) + strike count;
+        # ≥ MAX_FLOOD_STRIKES or non-flood → enter fallback (clear message
+        # ref so turn-end's _deliver_response sends rest as a fresh reply).
+        # Reset alongside _text_message / _tool_status on turn boundary.
+        self._text_edit_supported = True
+        self._text_flood_strikes = 0
+        self._text_edit_interval = _TEXT_EDIT_INTERVAL_BASE
+        self._tool_edit_supported = True
+        self._tool_flood_strikes = 0
+        self._tool_edit_interval = _TOOL_EDIT_INTERVAL_BASE
         self._stopping = False  # set on graceful shutdown to break supervisor loop
         # 消息状态 reaction: 👀 = SDK 开始处理这条 / 👌 = 这条触发的 turn 已结束.
         # _pending_marks: submit 后等下个 _begin_turn 接管 (push 到 active_marks 并打 👀)
         # _active_marks: 当前 turn 已 picked_up; turn_end 时打 👌 并清空
         # 每条 mark = (bot, chat_id, message_id). bot 用 Any 因为 PTB Bot 实例 (含 ctx.bot)
         self._pending_marks: list[tuple[Any, int, int]] = []
+        # idempotency: 跟 _pending_marks / _active_marks 同步, turn_end 时
+        # _mark_processed all (per-V-msg 标 done, 多 V msg batch 一个 turn 全标).
+        self._pending_update_ids: list[int | None] = []
+        self._active_update_ids: list[int | None] = []
         self._active_marks: list[tuple[Any, int, int]] = []
         self._reaction_tasks: set[asyncio.Task[None]] = set()
         # P2-A: 串行所有 reaction API 调用, 保证 schedule 顺序 = 执行顺序
@@ -450,6 +750,19 @@ class ChannelWorker:
         # 一条的 reply 上 (即使 SDK 把多条 batch 成一个 turn 也能保持 per-message
         # reply 体验).
         self._active_reply_payload: Payload | None = None
+        # Cut-in 队列 (interrupt 模式): V 流式中再发 → SDK interrupt + append 到这.
+        # _handle_turn_end 末尾 pop 出来 _begin_turn 启动新 turn. submit() 不再
+        # 改 anchor 状态 (留给老 turn 自然收尾), V 看到的 in-flight 气泡保留.
+        self._pending_payloads: list[Payload] = []
+        # Codex round-2 P0: turn epoch token. _begin_turn / _reset_turn_state
+        # 每次 bump. _spawn_interrupt capture 当时 epoch, 实际 fire interrupt 前
+        # check epoch 没变才继续 — 防 fire-and-forget interrupt 因 race 打断错的
+        # 后续 turn (例: A 自然完 → _begin_turn(B) → 老 interrupt 命中 B).
+        self._turn_epoch: int = 0
+        # Codex round-4 P2 (dedupe): 同 epoch 内多 cut-in (V 连发 m2 m3 m4) 别
+        # 重复 spawn interrupt — SDK round-trip 浪费 + log noise. epoch bump 后
+        # 自然对不上, 重置.
+        self._interrupt_spawned_epoch: int = -1
 
     async def start(self) -> None:
         await self.session.connect()
@@ -484,7 +797,9 @@ class ChannelWorker:
         if chat is None or msg is None:
             return
 
-        bridge.set_context(payload.ctx.bot, chat.id, msg.message_id)
+        # bridge.set_context 移到 _begin_turn (Codex round-1 P1): cut-in 不该
+        # 改 reply_to, 否则 A turn 中的 mcp_send 会带 B 的 message_id reply,
+        # B 的 turn 拿不到 anchor (turn_end finally 清 reply_to=None).
         self._last_user_msg_id = msg.message_id
 
         async with self._state_lock:
@@ -497,43 +812,26 @@ class ChannelWorker:
             # next SDK turn if the race between submit and turn_end leaves
             # _turn_payload unset.
             self._latest_payload = payload
-            # 消息状态: 入 _pending_marks 队列, 等 _begin_turn 接管时一起 fire 👀
-            self._pending_marks.append((payload.ctx.bot, chat.id, msg.message_id))
-            # 切流式输出 anchor 到新消息: 后续 text_delta / tool_event 会 reply
-            # 到这条 V 消息, 不接前一条 reply. 上一条 reply 停在最后流式状态
-            # (V 看到的是 msg1 reply 中途断, msg2 reply 续上后续内容).
-            # P1-A/B: anchor_generation += 1 让 in-flight text_delta/tool_event
-            # await 醒来后检测到 stale → abort, 不污染新 anchor 状态.
-            self._anchor_generation += 1
-            self._text_message = None
-            self._text_buffer = ""
-            self._text_last_edit = 0.0
-            self._tool_status = None
-            self._tool_entries = []
-            self._tool_last_edit = 0.0
-            self._active_reply_payload = payload
-            if not self._turn_active:
+            # 消息状态: append + 立即 fire 👀 — V 视角"看到这条了". 切入消息也即时
+            # 拿到 ack, 不再等下个 _begin_turn (_begin_turn 不再 fire 👀, 只挪账).
+            new_mark = (payload.ctx.bot, chat.id, msg.message_id)
+            self._pending_marks.append(new_mark)
+            self._pending_update_ids.append(payload.update_id)
+            self._schedule_marks([new_mark], "👀")
+            if self._turn_active:
+                # Cut-in (interrupt 模式 + R3 P0 fix): V 流式中再发. 保留老 turn
+                # 状态 — 已 ship 气泡 + in-flight 气泡都不动 (V 看见 A 半句留在 A
+                # 下面). interrupt 让 SDK 尽快收尾老 turn. **不**立即 session.submit(B)
+                # — B 留在 _pending_payloads, 等 A's turn_end → _begin_turn(B) 时才
+                # 入 SDK inbox. 否则 stale interrupt 可能命中 B (race) + SDK batch
+                # 模式卡死 (m1+m2 合并 ResultMessage 但我们 promote m2 等不到第二
+                # turn_end). codex R3 P0 验证.
+                self._pending_payloads.append(payload)
+                self._spawn_interrupt()
+            else:
+                self._active_reply_payload = payload
                 self._begin_turn(payload)
-
-            try:
-                self.session.submit(payload.text, payload.images)
-            except RuntimeError:
-                log.warning("LiveSession was disconnected; reconnecting before submit")
-                try:
-                    await self.session.connect()
-                    self.session.submit(payload.text, payload.images)
-                except Exception as e:
-                    # MINOR-1 fix: 二次失败 silent loss + in_flight 卡死 →
-                    # 回滚 (fire 💔 给已 push 的 mark + reset turn state),
-                    # V 通过 reaction 看到这条 V msg 没成功.
-                    log.error(
-                        "Second submit failed: %s — dropping V message", e
-                    )
-                    self._reset_turn_state(
-                        exit_inflight=True,
-                        drop_pending=True,
-                        fail_emoji="💔",
-                    )
+                await self._submit_to_session(payload)
 
     async def interrupt(self) -> None:
         await self.session.interrupt()
@@ -570,21 +868,36 @@ class ChannelWorker:
         self._latest_payload = payload  # keep latest in sync
         # P1-A/B: 切 anchor 时 +1 generation. P1.4 promote 路径走这里, 也要 bump.
         self._anchor_generation += 1
+        # Codex round-2 P0: bump turn_epoch — invalidate 老 cut-in 还没 fire 的
+        # interrupt task (它在 _spawn_interrupt 内 check, epoch 变了直接 return).
+        self._turn_epoch += 1
         self._active_reply_payload = payload  # 同步切 reply anchor
+        # Codex round-1 P1: bridge anchor 跟 turn 走 — cut-in 不动, _begin_turn
+        # 时切到当前 turn 的 V msg, 让 mcp_send (cron 等) reply 到对的 message.
+        chat = payload.update.effective_chat
+        if msg is not None and chat is not None:
+            bridge.set_context(payload.ctx.bot, chat.id, msg.message_id)
         self._turn_anchor = msg.message_id if msg else None
+        if self._stale_text_messages:
+            self._spawn_orphan_cleanup(self._stale_text_messages)
         self._tool_status = None
         self._tool_entries = []
         self._tool_last_edit = 0.0
         self._text_message = None
         self._text_buffer = ""
         self._text_last_edit = 0.0
-        # 消息状态: pending → active, 给本 turn 覆盖的所有 V message 打 👀
-        # (单 turn 可能聚合多条 message: 第一条立即 _begin_turn 时 pending=[m1];
-        # 其后 turn 结束 P1.4 promote 路径再 _begin_turn 时 pending 可能 [m2, m3, ...])
+        self._streamed_bubble_count = 0
+        self._stale_text_messages = []
+        self._reset_flood_state()
+        # 消息状态 promote: pending → active. 👀 已在 submit fire (每条 V msg
+        # 立即 ack), 这里只挪账, 不再 fire — 避免重复 setMessageReaction 调用.
+        # Codex round-1 P0: 只 promote 第一个 pending mark/uid 不是全部 — 多
+        # cut-in (m2 + m3 都在 m1 turn 内) 时 _begin_turn(m2) 全 promote 会让
+        # m3 跟 m2 一起被当 turn-end 时 fire 👌, m3 永远不会有自己的 turn 处理.
+        # 单 cut-in 是 1-to-1 不受影响.
         if self._pending_marks:
-            self._active_marks = self._pending_marks
-            self._pending_marks = []
-            self._schedule_marks(self._active_marks, "👀")
+            self._active_marks = [self._pending_marks.pop(0)]
+            self._active_update_ids = [self._pending_update_ids.pop(0)]
         _inflight_enter()
 
     async def _consume_events(self) -> None:
@@ -641,6 +954,83 @@ class ChannelWorker:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
 
+    def _reset_flood_state(self) -> None:
+        """Reset flood-control / fallback state at every turn / cut-in boundary.
+
+        Called from `_begin_turn`, cut-in path (line ~750), and `_reset_turn_state`.
+        Without reset the counters would carry strikes from one turn into the
+        next, prematurely disabling edits when only the previous turn hit
+        flood control.
+        """
+        self._text_edit_supported = True
+        self._text_flood_strikes = 0
+        self._text_edit_interval = _TEXT_EDIT_INTERVAL_BASE
+        self._tool_edit_supported = True
+        self._tool_flood_strikes = 0
+        self._tool_edit_interval = _TOOL_EDIT_INTERVAL_BASE
+
+    @staticmethod
+    def _is_flood_error(exc: BaseException) -> bool:
+        """Classify a TG edit/send failure as flood-control vs other.
+
+        PTB raises `telegram.error.RetryAfter` for HTTP 429 with retry_after
+        attribute (always flood). Some flood errors come back as generic
+        `BadRequest` with text containing flood-related keywords — match
+        those too. Hermes uses the same string fallback
+        (`stream_consumer.py:_is_flood_error`).
+
+        Codex round-1 caught a false negative: bare "Too Many Requests"
+        without "rate" / "retry after" / "flood" was misclassified as
+        non-flood, prematurely tripping the strike counter into fallback.
+        Adding "too many requests" closes that gap.
+        """
+        try:
+            from telegram.error import RetryAfter
+            if isinstance(exc, RetryAfter):
+                return True
+        except ImportError:
+            pass
+        msg = str(exc).lower()
+        return (
+            "flood" in msg
+            or "retry after" in msg
+            or "rate" in msg
+            or "too many requests" in msg
+        )
+
+    def _on_text_edit_failure(self, exc: BaseException) -> None:
+        """Adaptive backoff + 3-strike fallback (hermes pattern).
+
+        Flood error: ×2 interval (cap _MAX_EDIT_INTERVAL), increment strike.
+        ≥ _MAX_FLOOD_STRIKES OR non-flood: enter fallback — drop _text_message
+        ref so turn-end's `_deliver_response` sends remaining content as a
+        fresh reply_text rather than retrying edits forever.
+        """
+        if self._is_flood_error(exc):
+            self._text_flood_strikes += 1
+            self._text_edit_interval = min(
+                self._text_edit_interval * 2, _MAX_EDIT_INTERVAL,
+            )
+            if self._text_flood_strikes < _MAX_FLOOD_STRIKES:
+                return
+        # Non-flood OR strikes exhausted → fallback. Clear ref so the turn-end
+        # _deliver_response branch (line ~1099, "_text_message is None") routes
+        # final content via reply_text instead of edit_text.
+        self._text_edit_supported = False
+        self._text_message = None
+
+    def _on_tool_edit_failure(self, exc: BaseException) -> None:
+        """Same as `_on_text_edit_failure` but for the tool-status lane."""
+        if self._is_flood_error(exc):
+            self._tool_flood_strikes += 1
+            self._tool_edit_interval = min(
+                self._tool_edit_interval * 2, _MAX_EDIT_INTERVAL,
+            )
+            if self._tool_flood_strikes < _MAX_FLOOD_STRIKES:
+                return
+        self._tool_edit_supported = False
+        self._tool_status = None
+
     async def _handle_text_delta(self, chunk: str) -> None:
         if not chunk:
             return
@@ -663,7 +1053,123 @@ class ChannelWorker:
             return
 
         self._text_buffer += chunk
+
+        # Fallback mode (3 prior flood strikes): drop streaming edits entirely.
+        # Buffer stays accumulated so turn-end _deliver_response can ship it
+        # (it splits on \n\n\n itself).
+        if not self._text_edit_supported:
+            return
+
+        # \n\n\n marker = LLM-driven bubble break (see _TG_SOURCE_PROMPT).
+        # Close the current bubble (final-edit it) and start a fresh one for
+        # the next chunks. Loop handles multiple markers in one delta (rare).
+        # streamed_bubble_count tracks bubbles successfully shipped — only
+        # increments on real send/edit success so _deliver_response can resend
+        # any that flood-failed mid-stream. Long bubbles are delivered as plain
+        # chunks because rendered HTML cannot be split safely at arbitrary
+        # Telegram boundaries.
+        while "\n\n\n" in self._text_buffer:
+            prefix, tail = self._text_buffer.split("\n\n\n", 1)
+            prefix = prefix.rstrip()
+            sent_ok = False
+            shipped_msgs: list[Any] = []
+            if prefix:
+                if gen != self._anchor_generation:
+                    return
+                parts, parse_mode = _format_bubble_parts(prefix)
+                if not parts:
+                    self._text_buffer = tail.lstrip("\n")
+                    continue
+                first_part = parts[0]
+                rest = parts[1:]
+                if self._text_message is not None:
+                    edit_ok = False
+                    try:
+                        await self._text_message.edit_text(
+                            first_part, **_parse_kwargs(parse_mode)
+                        )
+                        edit_ok = True
+                    except Exception:
+                        # HTML may be rejected; retry the whole bubble as plain.
+                        try:
+                            raw_parts = _split(prefix) or [prefix[:_MAX_TG]]
+                            await self._text_message.edit_text(raw_parts[0])
+                            rest = raw_parts[1:]
+                            parse_mode = None
+                            edit_ok = True
+                        except Exception as plain_e:
+                            if gen == self._anchor_generation:
+                                self._stale_text_messages.append(self._text_message)
+                                self._on_text_edit_failure(plain_e)
+                    if edit_ok and gen == self._anchor_generation:
+                        self._text_flood_strikes = 0
+                        self._text_edit_interval = _TEXT_EDIT_INTERVAL_BASE
+                        sent_ok = True
+                        shipped_msgs.append(self._text_message)
+                else:
+                    reply_ok = False
+                    new_msg = None
+                    try:
+                        new_msg = await msg.reply_text(
+                            first_part, **_parse_kwargs(parse_mode)
+                        )
+                        reply_ok = True
+                    except Exception:
+                        try:
+                            raw_parts = _split(prefix) or [prefix[:_MAX_TG]]
+                            new_msg = await msg.reply_text(raw_parts[0])
+                            rest = raw_parts[1:]
+                            parse_mode = None
+                            reply_ok = True
+                        except Exception as plain_e:
+                            if gen == self._anchor_generation:
+                                self._on_text_edit_failure(plain_e)
+                    if reply_ok:
+                        if gen != self._anchor_generation:
+                            self._spawn_orphan_cleanup([new_msg])
+                        else:
+                            sent_ok = True
+                            shipped_msgs.append(new_msg)
+                if sent_ok and rest:
+                    rest_failed = False
+                    for p in rest:
+                        rp = None
+                        try:
+                            rp = await msg.reply_text(
+                                p, **_parse_kwargs(parse_mode)
+                            )
+                        except Exception:
+                            if parse_mode:
+                                try:
+                                    rp = await msg.reply_text(p)
+                                except Exception:
+                                    rest_failed = True
+                                    break
+                            else:
+                                rest_failed = True
+                                break
+                        if rp is not None:
+                            shipped_msgs.append(rp)
+                    if rest_failed:
+                        # Whole-bubble rollback: stale-queue every shipped part
+                        # so _deliver_response can resend the bubble cleanly.
+                        self._stale_text_messages.extend(shipped_msgs)
+                        sent_ok = False
+            # P0 gen check: close-bubble state writes must not pollute new anchor.
+            if gen != self._anchor_generation:
+                # shipped_msgs are now orphan replies under the old anchor.
+                if shipped_msgs:
+                    self._spawn_orphan_cleanup(shipped_msgs)
+                return
+            self._text_message = None
+            self._text_buffer = tail.lstrip("\n")
+            self._text_last_edit = 0.0
+            if sent_ok:
+                self._streamed_bubble_count += 1
+
         now = time.monotonic()
+        if not self._text_buffer:
+            return
         if len(self._text_buffer) <= _MAX_TG:
             display = self._text_buffer
         else:
@@ -672,17 +1178,32 @@ class ChannelWorker:
         if self._text_message is None:
             try:
                 new_reply = await msg.reply_text(display or "…")
-            except Exception:
+            except Exception as e:
+                # First-send flood: classify and possibly enter fallback so we
+                # don't pound TG with retries. Tail still in _text_buffer →
+                # _deliver_response covers it at turn end.
+                # Gen-check before mutating shared state: cut-in may have
+                # bumped generation while reply_text awaited; this failure
+                # belongs to the now-stale anchor, don't poison new state.
+                # Codex round-1 fix.
+                if gen == self._anchor_generation:
+                    self._on_text_edit_failure(e)
                 return
-            # P1-A: gen 没变才装回 _text_message. 变了说明 submit 已经切到新
-            # anchor, 这条 reply 是孤儿 (V 看到一条 "…" 或 first chunk 的孤立
-            # reply), 不能装回去覆盖新 anchor 的 _text_message=None 状态.
+            # P1-A: gen 没变才装回 _text_message. 变了说明 submit 已切到新 anchor,
+            # 这条 reply 在旧 m_old 下是 orphan — 删掉, 让 V 只看到 m_new 下的新
+            # reply (符合 V spec "切入后回复在对应消息下面"; 留着会让 V 看到 m_old
+            # 下的 "…"/half-chunk 残留, 跟终端体感不齐).
             if gen == self._anchor_generation:
                 self._text_message = new_reply
                 self._text_last_edit = now
+            else:
+                self._spawn_orphan_cleanup([new_reply])
             return
 
-        if now - self._text_last_edit < 2.0:
+        # Adaptive interval: doubles on each flood strike, resets to base on
+        # successful edit (handled below). _text_edit_interval is per-stream
+        # state set by `_on_text_edit_failure`.
+        if now - self._text_last_edit < self._text_edit_interval:
             return
         # P1-A: 在 edit await 前再查一次 gen — 变了就 abort, 不把新 chunk
         # 写到旧 reply (chunk 在 V 视角属于新 anchor).
@@ -692,8 +1213,15 @@ class ChannelWorker:
         target = self._text_message
         try:
             await target.edit_text(display)
-        except Exception:
-            pass
+            # Gen-check after await: if cut-in landed while edit awaited,
+            # this success belongs to the old anchor — don't reset *new*
+            # anchor's flood state with this stale outcome. Codex round-1.
+            if gen == self._anchor_generation:
+                self._text_flood_strikes = 0
+                self._text_edit_interval = _TEXT_EDIT_INTERVAL_BASE
+        except Exception as e:
+            if gen == self._anchor_generation:
+                self._on_text_edit_failure(e)
         try:
             await chat.send_action("typing")
         except Exception:
@@ -729,18 +1257,33 @@ class ChannelWorker:
             return
 
         body = "\n".join(self._tool_entries[-30:])[:_MAX_TG]
+        # Fallback mode: stop editing tool_status. Tool entries continue to
+        # accumulate in _tool_entries (V loses live progress, but turn-end
+        # still shows the work via _deliver_response's resp.tools / final
+        # response text). We don't try to flush tool entries as a fresh
+        # message because they're transient by design (verbose=1 deletes
+        # them on _deliver_response anyway).
+        if not self._tool_edit_supported:
+            return
         if self._tool_status is None:
             try:
                 new_status = await msg.reply_text(body)
-            except Exception:
+            except Exception as e:
+                # Gen-check (Codex round-1): same race as _handle_text_delta.
+                if gen == self._anchor_generation:
+                    self._on_tool_edit_failure(e)
                 return
+            # P1-B 同 _handle_text_delta: gen mismatch = orphan tool_status 在 m_old
+            # 下, 删掉避免 V 在错误 anchor 下看到孤立 tool 状态.
             if gen == self._anchor_generation:
                 self._tool_status = new_status
                 self._tool_last_edit = time.monotonic()
+            else:
+                self._spawn_orphan_cleanup([new_status])
             return
 
         now = time.monotonic()
-        if now - self._tool_last_edit < 2.0:
+        if now - self._tool_last_edit < self._tool_edit_interval:
             return
         if gen != self._anchor_generation:
             return
@@ -748,8 +1291,12 @@ class ChannelWorker:
         target = self._tool_status
         try:
             await target.edit_text(body)
-        except Exception:
-            pass
+            if gen == self._anchor_generation:
+                self._tool_flood_strikes = 0
+                self._tool_edit_interval = _TOOL_EDIT_INTERVAL_BASE
+        except Exception as e:
+            if gen == self._anchor_generation:
+                self._on_tool_edit_failure(e)
         try:
             await chat.send_action("typing")
         except Exception:
@@ -790,15 +1337,19 @@ class ChannelWorker:
                         resp.session_id[:8] if resp.session_id else "new",
                     )
             finally:
-                # SDK 在 V 快速连发时会把多条 V msg batch 成一个 turn (实测:
-                # bot 一个 reply 同时回 m1+m2). 这种情况下 turn_end 处理了所有
-                # 累积 V msg, 给它们都 fire 👌. per-msg case (理想 SDK 行为)
-                # pending=[], active=[m_current] — 也兼容.
-                all_done = self._active_marks + self._pending_marks
+                # 只 fire 👌 给 _active_marks (= 当前 turn 的 V msgs). _pending_marks
+                # 是 cut-in 期间 push 的 (= 下一 turn 的 V msgs), 留着等 _begin_turn
+                # promote 进 _active_marks. SDK 真 batch 多 V msg 进一个 turn 的话,
+                # _pending_marks 在那时本就是空 (submit 只在 turn_active 才 push 到
+                # pending). 所以这里只动 active 是对的.
+                done_marks = self._active_marks
+                done_uids = self._active_update_ids
                 self._active_marks = []
-                self._pending_marks = []
-                if all_done:
-                    self._schedule_marks(all_done, "👌")
+                self._active_update_ids = []
+                if done_marks:
+                    self._schedule_marks(done_marks, "👌")
+                for _uid in done_uids:
+                    await _mark_processed(_uid)
                 self._reset_turn_state(exit_inflight=True)
                 # Turn 结束 → 清 bridge.reply_to. 不清的话, V turn 之后 cron
                 # 走 mcp__tg__tg_send_* 发的消息 (gmail PR-merged 通报 / weekly
@@ -807,9 +1358,17 @@ class ChannelWorker:
                 # 个 chat. 只清 reply_to.
                 with suppress(Exception):
                     bridge.reply_to = None
-                # 不再 P1.4 promote — batch 模式 SDK 不会发第二个 turn_end,
-                # promote 会让 in_flight 永久卡死. per-msg 模式后续 SDK ev
-                # 通过 _handle_text_delta 的 _latest_payload fallback 渲染.
+                # Cut-in interrupt 模式 (R3 P0 fix): pending payloads 启动下一
+                # turn. _begin_turn 内 promote _pending_marks → _active_marks,
+                # 设新 anchor + bump gen + epoch. 然后 _submit_to_session 才把
+                # B 推入 SDK inbox — cut-in 时不 submit, 这里才 submit, 防 stale
+                # interrupt + SDK batch 卡死.
+                next_payload = (
+                    self._pending_payloads.pop(0) if self._pending_payloads else None
+                )
+                if next_payload is not None:
+                    self._begin_turn(next_payload)
+                    await self._submit_to_session(next_payload)
 
     async def _handle_error(self, exc: Exception) -> None:
         log.error("CC stream failed: %s", exc)
@@ -868,37 +1427,77 @@ class ChannelWorker:
             except Exception:
                 pass
 
+        # Delete stale partials early — must run before any return path so
+        # they don't stay visible if resp.content is empty.
+        if self._stale_text_messages:
+            for stale in self._stale_text_messages:
+                try:
+                    await stale.delete()
+                except Exception:
+                    pass
+            self._stale_text_messages = []
+
         if not resp.content:
             await msg.reply_text("(no response)")
             return
 
-        html_text = _to_html(resp.content)
-        parts = _split(html_text)
-        if self._text_message and parts:
-            try:
-                await self._text_message.edit_text(parts[0], parse_mode="HTML")
-            except Exception:
-                try:
-                    raw_parts = _split(resp.content)
-                    await self._text_message.edit_text(raw_parts[0])
-                    for pp in raw_parts[1:]:
-                        await msg.reply_text(pp)
-                    parts = []
-                except Exception:
-                    pass
-            for part in parts[1:]:
-                try:
-                    await msg.reply_text(part, parse_mode="HTML")
-                except Exception:
-                    await msg.reply_text(part)
-        else:
+        # Streaming has already shipped `_streamed_bubble_count` bubbles via
+        # reply_text in _handle_text_delta; _text_message (if any) holds the
+        # trailing partial. Compute what's still pending from the final.
+        bubbles = re.split(r"\n{3,}", resp.content)
+        # Drop leading + trailing empty bubbles (LLM may bracket with markers).
+        while bubbles and not bubbles[-1].strip():
+            bubbles.pop()
+        while bubbles and not bubbles[0].strip():
+            bubbles.pop(0)
+        pending = bubbles[self._streamed_bubble_count:]
+        if not pending:
+            return
+
+        async def _send_bubble(bubble: str) -> None:
+            bubble = bubble.strip()
+            if not bubble:
+                return
+            parts, parse_mode = _format_bubble_parts(bubble)
             for part in parts:
                 try:
-                    await msg.reply_text(part, parse_mode="HTML")
+                    await msg.reply_text(part, **_parse_kwargs(parse_mode))
                 except Exception:
-                    for pp in _split(resp.content):
-                        await msg.reply_text(pp)
+                    if parse_mode:
+                        for pp in _split(bubble):
+                            await msg.reply_text(pp)
                     break
+
+        if self._text_message:
+            # First pending bubble = trailing partial in _text_message; finalize.
+            target = pending[0]
+            target_text = target.strip()
+            parts, parse_mode = _format_bubble_parts(target_text)
+            if parts:
+                try:
+                    await self._text_message.edit_text(
+                        parts[0], **_parse_kwargs(parse_mode)
+                    )
+                except Exception:
+                    try:
+                        raw_parts = _split(target_text)
+                        await self._text_message.edit_text(raw_parts[0])
+                        for pp in raw_parts[1:]:
+                            await msg.reply_text(pp)
+                        parts = []
+                    except Exception:
+                        pass
+                for part in parts[1:]:
+                    try:
+                        await msg.reply_text(part, **_parse_kwargs(parse_mode))
+                    except Exception:
+                        if parse_mode:
+                            await msg.reply_text(part)
+            for bubble in pending[1:]:
+                await _send_bubble(bubble)
+        else:
+            for bubble in pending:
+                await _send_bubble(bubble)
 
     def _apply_accounting(self, resp: Response) -> None:
         global _session_cost, _session_turns, _last_model, _last_context_window
@@ -947,12 +1546,17 @@ class ChannelWorker:
         self._turn_active = False
         self._turn_payload = None
         self._turn_anchor = None
+        if self._stale_text_messages:
+            self._spawn_orphan_cleanup(self._stale_text_messages)
         self._tool_status = None
         self._tool_entries = []
         self._tool_last_edit = 0.0
         self._text_message = None
         self._text_buffer = ""
         self._text_last_edit = 0.0
+        self._streamed_bubble_count = 0
+        self._stale_text_messages = []
+        self._reset_flood_state()
         # 失败路径 (error / reset / resume / submit retry fail): fire 💔 给
         # active + (drop 模式下) pending 让 V 一眼看到这些 V message 没正常完成.
         # turn_end 路径不传 fail_emoji — finally 段已经手动 fire 过 👌.
@@ -966,11 +1570,22 @@ class ChannelWorker:
         self._active_reply_payload = None
         # P1-A/B: bump generation 让 in-flight handler 看到 stale.
         self._anchor_generation += 1
+        # Codex round-2 P1: bump turn_epoch 让 in-flight interrupt task 看到 stale
+        # (reset/error 路径 client 可能已 dead, 老 interrupt 命中重置后的 client 危险).
+        self._turn_epoch += 1
         # P2-D: reset/error/resume 路径要清 _pending_marks (这些 mark 的 V 消息
         # 永远不会被处理了 — /new 后 inbox 已 drain). turn_end 路径不清, 留给
         # P1.4 promote 给下个 SDK turn 用.
+        # idempotency: error/resume reset 把 V 已收到 💔 的 update 标 done,
+        # 重启 TG 重交付时跳过 (V 不会看到重做的 reply, V "不要重做"). _active
+        # 也一起标 — 这条 turn 已被 abort, V 已知失败, 重启不该再跑.
+        self._schedule_mark_processed(self._active_update_ids)
+        self._active_update_ids = []
         if drop_pending:
+            self._schedule_mark_processed(self._pending_update_ids)
+            self._pending_update_ids = []
             self._pending_marks = []
+            self._pending_payloads = []
         if exit_inflight and was_active:
             _inflight_exit()
 
@@ -979,6 +1594,83 @@ class ChannelWorker:
         if not marks:
             return
         task = asyncio.create_task(self._fire_marks(list(marks), emoji))
+        self._reaction_tasks.add(task)
+        task.add_done_callback(self._reaction_tasks.discard)
+
+    def _schedule_mark_processed(self, uids: list[int | None]) -> None:
+        """Fire-and-forget mark processed: sync-callable, async 落盘. 用于 reset
+        路径 (sync function 不能 await), 或 error/💔 路径 V 已知失败不重做."""
+        valid = [u for u in uids if u is not None]
+        if not valid:
+            return
+        async def _do():
+            for u in valid:
+                await _mark_processed(u)
+        task = asyncio.create_task(_do())
+        self._reaction_tasks.add(task)
+        task.add_done_callback(self._reaction_tasks.discard)
+
+    async def _submit_to_session(self, payload: Payload) -> None:
+        """Submit payload to LiveSession with reconnect retry. 二次失败 → reset
+        turn state + 💔. 从 submit() else 分支 + _handle_turn_end finally 调.
+        Codex R3 P0 fix: cut-in 路径不再立即 submit, 等 A's turn_end 后由
+        _begin_turn(B) 触发本函数 — 防 stale interrupt 命中 B + SDK batch 卡死."""
+        try:
+            self.session.submit(payload.text, payload.images)
+            return
+        except RuntimeError:
+            log.warning("LiveSession was disconnected; reconnecting before submit")
+        try:
+            await self.session.connect()
+            self.session.submit(payload.text, payload.images)
+        except Exception as e:
+            log.error("Second submit failed: %s — dropping V message", e)
+            self._reset_turn_state(
+                exit_inflight=True,
+                drop_pending=True,
+                fail_emoji="💔",
+            )
+
+    def _spawn_interrupt(self) -> None:
+        """Fire-and-forget SDK interrupt (cut-in 用). 不持 _state_lock 的 await,
+        让 A 的 turn_end 不被 block. 失败 → 降级 queue 模式 (A 自然完, B 等).
+
+        Codex round-2 epoch guard: capture self._turn_epoch, fire interrupt 前
+        check epoch 没变. 防 race: A 自然完 → _begin_turn(B) bumps epoch → 老
+        interrupt 此时 fire 会打断 B 而不是 A. epoch != captured → 直接 return.
+        reset/error 也 bump epoch, 防 interrupt 命中 dead/reset client.
+
+        Codex round-4 P2 dedupe: 同 epoch 已 spawn 过 → return (V 连发 m2 m3 m4
+        在 m1 turn 内, 三次都触发 cut-in, 但 SDK 只需 interrupt 一次)."""
+        captured_epoch = self._turn_epoch
+        if self._interrupt_spawned_epoch == captured_epoch:
+            return
+        self._interrupt_spawned_epoch = captured_epoch
+        async def _do() -> None:
+            await asyncio.sleep(0)  # yield: 让 A 的自然 turn_end 有机会 fire
+            if self._turn_epoch != captured_epoch:
+                return
+            try:
+                await self.session.interrupt()
+            except Exception as e:
+                log.warning("session.interrupt() failed: %s", e)
+        task = asyncio.create_task(_do())
+        self._reaction_tasks.add(task)
+        task.add_done_callback(self._reaction_tasks.discard)
+
+    def _spawn_orphan_cleanup(self, msgs: list[Any]) -> None:
+        """Fire-and-forget delete of orphan TG messages (cut-in / race cleanup).
+        复用 _reaction_tasks 集合, 让 stop() 能等清理完成 (避免 Task destroyed warning).
+        """
+        if not msgs:
+            return
+        async def _delete_all() -> None:
+            for m in msgs:
+                try:
+                    await m.delete()
+                except Exception as e:
+                    log.debug("orphan reply delete failed: %s", e)
+        task = asyncio.create_task(_delete_all())
         self._reaction_tasks.add(task)
         task.add_done_callback(self._reaction_tasks.discard)
 
@@ -1762,11 +2454,13 @@ async def cmd_provider(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def on_provider_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    if not ALLOWED_USER or not (q.from_user and q.from_user.id == ALLOWED_USER):
-        await q.answer("auth denied")
+    if not await _callback_allowed(q):
         return
     await q.answer()
-    _, key = q.data.split(":", 1)
+    data = q.data or ""
+    if ":" not in data:
+        return
+    _, key = data.split(":", 1)
     target_name = dict((k, n) for n, k in _provider_choices()).get(key, key)
     await q.edit_message_text(f"🔄 切换到 {target_name}…")
     rc, body = await _run_cc_router_switch(key)
@@ -1791,8 +2485,31 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     path = Path(f"/tmp/voice_{voice.file_id}.ogg")
     await file.download_to_drive(path)
 
+    # voice-clone skill: 检测 pending state, 让 CC 拿到 wav 路径做声音克隆.
+    # state 文件按 BABATA_INSTANCE 隔离 (4 launchd 实例不串). 含 expires_at
+    # TTL + atomic rename consume 防 race + JSON 校验防 partial state.
+    voice_clone_state = STATE_DIR / f"voice-clone-pending-{INSTANCE}.json"
+    keep_wav: Path | None = None
+    if voice_clone_state.exists():
+        try:
+            import json as _json
+            meta = _json.loads(voice_clone_state.read_text())
+            if meta.get("expires_at", 0) > time.time():
+                # atomic consume: rename → 仅一个 handler 拿到 wav (FileNotFoundError = race lose)
+                consumed = voice_clone_state.with_suffix(".json.consumed")
+                try:
+                    voice_clone_state.rename(consumed)
+                    keep_wav = Path(f"/tmp/voice-clone-{INSTANCE}-{voice.file_id}.wav")
+                    consumed.unlink(missing_ok=True)
+                except FileNotFoundError:
+                    pass  # 别的 handler 抢到了
+            else:
+                voice_clone_state.unlink(missing_ok=True)  # stale, 自清
+        except (_json.JSONDecodeError, OSError) as _e:
+            log.warning("voice-clone state malformed: %s", _e)
+
     try:
-        text = await transcribe_voice(path)
+        text = await transcribe_voice(path, keep_wav=keep_wav)
     except Exception as e:
         await update.message.reply_text(f"\u274c 转录失败: {e}")
         return
@@ -1800,7 +2517,8 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         path.unlink(missing_ok=True)
 
     await update.message.reply_text(f"\U0001f3a4 {text}")
-    await _process(update, ctx, text)
+    prompt = f"[语音 wav: {keep_wav}] {text}" if keep_wav else f"[语音] {text}"
+    await _process(update, ctx, prompt)
 
 
 # Physical: TG albums (multi-photo messages) arrive as N separate Updates
@@ -1901,7 +2619,7 @@ async def on_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    prompt = f"{caption}\n\n[Video summary (mimo-v2-omni)]: {summary}" if caption else f"[Video summary (mimo-v2-omni)]: {summary}"
+    prompt = f"{caption}\n\n[Video summary (mimo-v2.5)]: {summary}" if caption else f"[Video summary (mimo-v2.5)]: {summary}"
     await _process(update, ctx, prompt)
 
 
@@ -1918,12 +2636,15 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     save_path = save_dir / doc.file_name
     await file.download_to_drive(save_path)
 
-    caption = update.message.caption or f"[received file: {save_path}]"
-    await _process(update, ctx, caption)
+    caption = update.message.caption or ""
+    prompt = f"[文件: {save_path}]\n{caption}" if caption else f"[文件: {save_path}]"
+    await _process(update, ctx, prompt)
 
 
 async def on_verbose_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
+    if not await _callback_allowed(query):
+        return
     await query.answer()
     global _verbose
     _verbose = int((query.data or "verbose:1").split(":")[1])
@@ -2013,6 +2734,8 @@ async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def on_resume_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Back-button callback: 从 Level 2 session 列表回到 Level 1 渠道 picker."""
     query = update.callback_query
+    if not await _callback_allowed(query):
+        return
     await query.answer()
     header, markup = _render_resume_channel_picker()
     try:
@@ -2026,6 +2749,8 @@ async def on_resume_channel_pick(
 ) -> None:
     """Level-1 callback: 用户选了某个渠道类别, 列该类别最近 session."""
     query = update.callback_query
+    if not await _callback_allowed(query):
+        return
     await query.answer()
     data = query.data or ""
     if not data.startswith("resume-ch:"):
@@ -2085,6 +2810,8 @@ async def on_resume_channel_pick(
 async def on_resume_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Level-2 callback: 用户选了具体 session, 切换 cc 活动 session."""
     query = update.callback_query
+    if not await _callback_allowed(query):
+        return
     await query.answer()
 
     data = query.data or ""
@@ -2169,6 +2896,8 @@ async def on_resume_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 async def on_button_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle MCP button click: resolve bridge future, send choice to CC."""
     query = update.callback_query
+    if not await _callback_allowed(query):
+        return
     await query.answer()
 
     data = query.data or ""
@@ -2205,6 +2934,10 @@ async def _process(
     images: list[dict[str, str]] | None = None,
 ) -> None:
     """Enqueue user input into the live CC session and return immediately."""
+    # Idempotency: 重启后 TG 重交付的 update 跳过, V 不会看到重做的 reply.
+    if update.update_id in _processed_set:
+        log.info("idempotent skip: update_id=%s already processed", update.update_id)
+        return
     chat = update.effective_chat
     msg = update.effective_message
     await chat.send_action("typing")
@@ -2225,7 +2958,7 @@ async def _process(
         text = f"[Replying to]: {quoted}\n\n{text}"
 
     try:
-        await _worker().submit(Payload(update=update, ctx=ctx, text=text, images=images))
+        await _worker().submit(Payload(update=update, ctx=ctx, text=text, images=images, update_id=update.update_id))
     except Exception as e:
         log.error("enqueue failed: %s", e)
         await msg.reply_text(f"Error: {e}")
@@ -2268,6 +3001,11 @@ async def _post_init(app: Application) -> None:
         sid = cc._session_id
         sid_display = sid if sid else "(new)"
         lines = [f"[{_CURRENT_LABEL}] 上线 · session: {sid_display}"]
+        # SIGKILL 兜底: graceful shutdown 没跑过 (e.g. poll-healthcheck SIGKILL),
+        # reason file 还在, 启动时读出来报告。Graceful 路径已 unlink, 这里 None.
+        startup_trigger = _pop_restart_reason()
+        if startup_trigger:
+            lines.append(f"上次重启原因: {startup_trigger}")
         if sid and cc.is_last_turn_orphan(sid):
             lines.append("⚠️ 上次 session 最后一条 user 无 assistant 回复 (可能 SIGKILL)")
         try:
@@ -2326,7 +3064,7 @@ def main() -> None:
     log.info("Bot starting (user: %s)", ALLOWED_USER)
     # stop_signals=None: 禁用 PTB 默认 SIGTERM/SIGINT 立即停止逻辑; 我们在
     # _post_init 里装 _install_signal_handlers, 走 graceful drain 路径.
-    app.run_polling(drop_pending_updates=True, stop_signals=None)
+    app.run_polling(drop_pending_updates=False, stop_signals=None)
 
 
 if __name__ == "__main__":

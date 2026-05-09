@@ -21,6 +21,78 @@ log = logging.getLogger(__name__)
 # the derived namespace-based default when not pre-set (terminal CC case).
 SOCKET_PATH = BRIDGE_SOCKET
 
+# Telegram caption limit, measured in UTF-16 code units (TG wire unit).
+# Borrows openclaw `caption.ts:1-15` `splitTelegramCaption` design: when
+# caption exceeds the limit, send the media without caption and ship the
+# full text as a separate follow-up message — never silently truncate.
+# Codex round-1 fix: codepoint count (`len()`) underestimates by 2x for
+# emoji/CJK Extension B / surrogate-pair chars; use UTF-16 to match TG's
+# actual rejection threshold ("MEDIA_CAPTION_TOO_LONG").
+_TG_MAX_CAPTION = 1024
+
+
+_TG_MAX_MESSAGE = 4096  # Telegram per-message limit (UTF-16 units)
+
+
+def _utf16_len(s: str) -> int:
+    """UTF-16 code-unit count (TG's wire unit). Mirrors bot._utf16_len."""
+    return len(s.encode("utf-16-le")) // 2
+
+
+def _chunk_for_message(text: str, limit: int = _TG_MAX_MESSAGE - 96) -> list[str]:
+    """Split a long text into TG-message-sized chunks (UTF-16 budget).
+
+    Codex round-2 fix Q5: caption overflow text was passed unchunked to
+    `bot.send_message`. A caption with > 4096 UTF-16 units (e.g. dense CJK
+    user instructions) would land caption-less media + a failed send →
+    partial side-effect with no recovery. Chunk before send. Pessimistic
+    96-unit slack matches bot.py `_MAX_TG=4000` so chunks survive any
+    HTML expansion downstream (none here, but stays consistent).
+    """
+    if _utf16_len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    remaining = text
+    while remaining:
+        if _utf16_len(remaining) <= limit:
+            chunks.append(remaining)
+            break
+        # Binary-search the largest codepoint prefix fitting the budget.
+        lo, hi = 1, len(remaining)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if _utf16_len(remaining[:mid]) <= limit:
+                lo = mid
+            else:
+                hi = mid - 1
+        cut = lo
+        # Prefer newline > space boundary within budget.
+        nl = remaining.rfind("\n", 0, cut)
+        if nl > cut // 2:
+            cut = nl
+        else:
+            sp = remaining.rfind(" ", 0, cut)
+            if sp > cut // 2:
+                cut = sp
+        chunks.append(remaining[:cut])
+        remaining = remaining[cut:].lstrip()
+    return chunks
+
+
+def _split_caption(text: str | None) -> tuple[str | None, str | None]:
+    """Return (caption, follow_up_text). caption goes on the media; follow_up
+    is sent as one or more separate text messages after the media when the
+    original text exceeds the TG caption limit. Either or both may be None.
+    """
+    if not text:
+        return None, None
+    trimmed = text.strip()
+    if not trimmed:
+        return None, None
+    if _utf16_len(trimmed) > _TG_MAX_CAPTION:
+        return None, trimmed
+    return trimmed, None
+
 
 class TGBridge:
     """Unix socket server dispatching MCP actions to the TG bot."""
@@ -141,24 +213,38 @@ class TGBridge:
         await self._respond(writer, choice)
 
     async def _handle_send_text(self, request, writer) -> None:
-        await self.bot.send_message(
-            chat_id=self.chat_id, text=request["text"],
-            reply_to_message_id=self.reply_to,
-        )
-        await self._respond(writer, "Text sent")
+        chunks = _chunk_for_message(request["text"])
+        for chunk in chunks:
+            await self.bot.send_message(
+                chat_id=self.chat_id, text=chunk,
+                reply_to_message_id=self.reply_to,
+            )
+        suffix = f" ({len(chunks)} chunks)" if len(chunks) > 1 else ""
+        await self._respond(writer, f"Text sent{suffix}")
 
     async def _handle_send_file(self, request, writer) -> None:
         path = Path(request["path"]).expanduser()
         if not path.exists():
             await self._respond(writer, f"Error: file not found: {path}")
             return
-        caption = request.get("caption") or None
+        caption, follow_up = _split_caption(request.get("caption"))
         with path.open("rb") as f:
-            await self.bot.send_document(
+            sent = await self.bot.send_document(
                 chat_id=self.chat_id, document=f,
                 filename=path.name, caption=caption,
                 reply_to_message_id=self.reply_to,
             )
+        if follow_up:
+            # Thread follow-up under the media itself, not the original
+            # anchor — keeps text visually paired with the file (Codex
+            # round-1 fix 7). Chunk to respect TG 4096-unit message limit
+            # (Codex round-2 fix Q5).
+            anchor = sent.message_id if sent else self.reply_to
+            for chunk in _chunk_for_message(follow_up):
+                await self.bot.send_message(
+                    chat_id=self.chat_id, text=chunk,
+                    reply_to_message_id=anchor,
+                )
         await self._respond(writer, f"Sent: {path.name}")
 
     async def _handle_send_album(self, request, writer) -> None:
@@ -169,20 +255,34 @@ class TGBridge:
         if missing:
             await self._respond(writer, f"Error: not found: {missing}")
             return
-        caption = request.get("caption") or None
+        caption, follow_up = _split_caption(request.get("caption"))
         handles = [p.open("rb") for p in paths]
         try:
             media = [
                 InputMediaPhoto(media=f, caption=caption if i == 0 else None)
                 for i, f in enumerate(handles)
             ]
-            await self.bot.send_media_group(
+            sent_messages = await self.bot.send_media_group(
                 chat_id=self.chat_id, media=media,
                 reply_to_message_id=self.reply_to,
             )
         finally:
             for f in handles:
                 f.close()
+        if follow_up:
+            # send_media_group returns a tuple of Messages; reply follow-up
+            # to the FIRST photo so the text appears threaded under the
+            # album in TG (Codex round-1 fix 7). Chunk to respect TG 4096
+            # (Codex round-2 fix Q5).
+            anchor = (
+                sent_messages[0].message_id
+                if sent_messages else self.reply_to
+            )
+            for chunk in _chunk_for_message(follow_up):
+                await self.bot.send_message(
+                    chat_id=self.chat_id, text=chunk,
+                    reply_to_message_id=anchor,
+                )
         await self._respond(writer, f"Sent {len(paths)} images")
 
     async def _handle_send_location(self, request, writer) -> None:
@@ -226,13 +326,22 @@ class TGBridge:
         if not path.exists():
             await self._respond(writer, f"Error: file not found: {path}")
             return
-        caption = request.get("caption") or None
+        caption, follow_up = _split_caption(request.get("caption"))
         with path.open("rb") as f:
-            await self.bot.send_video(
+            sent = await self.bot.send_video(
                 chat_id=self.chat_id, video=f,
                 filename=path.name, caption=caption,
                 reply_to_message_id=self.reply_to,
             )
+        if follow_up:
+            # Thread follow-up under the video (Codex round-1 fix 7). Chunk
+            # to respect TG 4096 (Codex round-2 fix Q5).
+            anchor = sent.message_id if sent else self.reply_to
+            for chunk in _chunk_for_message(follow_up):
+                await self.bot.send_message(
+                    chat_id=self.chat_id, text=chunk,
+                    reply_to_message_id=anchor,
+                )
         await self._respond(writer, f"Video sent: {path.name}")
 
     async def _handle_send_page(self, request, writer) -> None:
