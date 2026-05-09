@@ -36,7 +36,7 @@ build-backend = "setuptools.build_meta"
 # entry script, .venv/bin/babata 不存在, install.sh 的 symlink 变 dangling.
 [tool.setuptools]
 py-modules = [
-    "bot", "bridge", "cc", "constants", "media",
+    "bot", "bridge", "cc", "codex_engine", "constants", "engine", "media",
     "tg_mcp", "weixin_account", "weixin_bot",
     "weixin_bridge", "weixin_ilink", "weixin_mcp",
     "sidebar_bot", "sidebar_bridge", "sidebar_events",

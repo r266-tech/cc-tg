@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -71,12 +72,17 @@ class FakeChat:
         self.actions.append(action)
 
 
+class FakeUser:
+    def __init__(self, user_id: int):
+        self.id = user_id
+
+
 class FakeUpdate:
-    def __init__(self, message: FakeMessage, chat: FakeChat):
+    def __init__(self, message: FakeMessage, chat: FakeChat, user_id: int | None = None):
         self.effective_message = message
         self.message = message
         self.effective_chat = chat
-        self.effective_user = None
+        self.effective_user = FakeUser(user_id) if user_id is not None else None
 
 
 class FakeBot:
@@ -85,9 +91,13 @@ class FakeBot:
 
     def __init__(self):
         self.reactions: list[tuple[int, int, str]] = []
+        self.commands: list[tuple[str, str]] = []
 
     async def set_message_reaction(self, *, chat_id, message_id, reaction):
         self.reactions.append((chat_id, message_id, reaction))
+
+    async def set_my_commands(self, commands):
+        self.commands = list(commands)
 
 
 class FakeCtx:
@@ -154,6 +164,116 @@ def reset_bot_globals(monkeypatch, tmp_path):
     bot._last_context_window = None
     bot._last_used_tokens = 0
     bot._last_cost = 0.0
+
+
+class FakeCpuSession:
+    def __init__(self, name: str, state_file: Path | None = None, sid: str | None = None):
+        self._babata_engine_name = name
+        self._state_file = state_file
+        self._session_id = sid
+
+    def _record_sid(self, sid: str | None):
+        if self._state_file is None:
+            return
+        try:
+            state = json.loads(self._state_file.read_text())
+        except Exception:
+            state = {}
+        state["session_id"] = sid
+        engine_sids = state.get("engine_session_ids")
+        if not isinstance(engine_sids, dict):
+            engine_sids = {}
+        engine_sids[self._babata_engine_name] = sid or ""
+        state["engine_session_ids"] = engine_sids
+        self._state_file.write_text(json.dumps(state))
+
+
+class FakeCpuWorker:
+    instances: list["FakeCpuWorker"] = []
+
+    def __init__(self, session, *, instance_label: str):
+        self.session = session
+        self.instance_label = instance_label
+        self._turn_active = False
+        self.started = False
+        self.stopped = False
+        FakeCpuWorker.instances.append(self)
+
+    async def start(self):
+        self.started = True
+
+    async def stop(self):
+        self.stopped = True
+
+
+def test_switch_cpu_rebuilds_worker_and_persists_choice(monkeypatch, tmp_path):
+    async def run():
+        state_file = tmp_path / "state.json"
+        state_file.write_text(json.dumps({"session_id": "claude-old"}))
+        monkeypatch.setattr(bot, "SESSION_FILE", state_file)
+        monkeypatch.setattr(bot, "_STATE_PATH", state_file)
+        bot._state = {}
+        bot._in_flight = 0
+        monkeypatch.setattr(bot, "cc", FakeCpuSession("claude", state_file, "claude-old"))
+        old_worker = FakeCpuWorker(bot.cc, instance_label="test")
+        monkeypatch.setattr(bot, "_channel_worker", old_worker)
+        FakeCpuWorker.instances = [old_worker]
+
+        def fake_make(target=None):
+            return FakeCpuSession(target or "claude")
+
+        monkeypatch.setattr(bot, "_make_tg_engine", fake_make)
+        monkeypatch.setattr(bot, "ChannelWorker", FakeCpuWorker)
+
+        result = await bot._switch_cpu("codex")
+
+        assert result == "CPU: Claude Code → Codex"
+        assert old_worker.stopped is True
+        assert bot._channel_worker is FakeCpuWorker.instances[-1]
+        assert bot._channel_worker.started is True
+        assert bot._current_cpu_name() == "codex"
+        state = json.loads(state_file.read_text())
+        assert state["assistant_engine"] == "codex"
+        assert state["engine_session_ids"]["claude"] == "claude-old"
+
+    asyncio.run(run())
+
+
+def test_bot_commands_are_filtered_by_cpu():
+    claude = [name for name, _ in bot._bot_commands_for_cpu("claude")]
+    codex = [name for name, _ in bot._bot_commands_for_cpu("codex")]
+
+    assert "context" in claude
+    assert "stop" in claude
+    assert "provider" in claude
+    assert "context" not in codex
+    assert "stop" not in codex
+    assert "provider" not in codex
+    assert {"new", "resume", "status", "verbose", "cpu", "restart"} <= set(codex)
+
+
+def test_codex_rejects_hidden_commands_when_typed(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        monkeypatch.setattr(bot, "ALLOWED_USER", 7)
+        monkeypatch.setattr(bot, "cc", FakeCpuSession("codex"))
+
+        ctx = FakeCtx()
+        chat = FakeChat()
+
+        context_msg = FakeMessage(10, "/context")
+        await bot.cmd_context(FakeUpdate(context_msg, chat, user_id=7), ctx)
+        assert "不支持" in context_msg.replies[-1].text
+
+        stop_msg = FakeMessage(11, "/stop")
+        await bot.cmd_stop(FakeUpdate(stop_msg, chat, user_id=7), ctx)
+        assert "不支持" in stop_msg.replies[-1].text
+
+        provider_msg = FakeMessage(12, "/provider")
+        await bot.cmd_provider(FakeUpdate(provider_msg, chat, user_id=7), ctx)
+        assert "不生效" in provider_msg.replies[-1].text
+
+    asyncio.run(run())
 
 
 def test_channel_worker_single_turn_clean_reset(monkeypatch, tmp_path):

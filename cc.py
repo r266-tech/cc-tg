@@ -520,9 +520,20 @@ class CC:
         except Exception as e:
             log.warning("Failed to persist session state: %s", e)
 
+    def _remember_engine_sid(self, state: dict, sid: str | None) -> None:
+        engine_name = getattr(self, "_babata_engine_name", None)
+        if not isinstance(engine_name, str) or not engine_name:
+            return
+        engine_sids = state.get("engine_session_ids")
+        if not isinstance(engine_sids, dict):
+            engine_sids = {}
+        engine_sids[engine_name] = sid or ""
+        state["engine_session_ids"] = engine_sids
+
     def _record_sid(self, sid: str | None) -> None:
         state = self._load_state()
         state["session_id"] = sid
+        self._remember_engine_sid(state, sid)
         # Touch activity timestamp on every sid write — _run() calls this after
         # each successful turn, so it doubles as the idle-reset clock.
         state["last_activity_at"] = time.time()

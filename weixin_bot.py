@@ -30,7 +30,7 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 from constants import PROJECT, STATE_DIR
-from cc import CC, VENV_PYTHON
+from engine import VENV_PYTHON, make_engine
 from media import transcribe_silk, understand_video
 from weixin_account import (
     add_allow_from, clear_stale_for_user, get_context_token, is_allowed,
@@ -101,7 +101,7 @@ _WX_SOURCE_PROMPT = (
     "Max 4000 chars/message."
 )
 
-cc = CC(
+cc = make_engine(
     state_file=STATE_DIR / f"{PROJECT}-weixin-session.json",
     source_prompt=_WX_SOURCE_PROMPT,
     mcp_servers={

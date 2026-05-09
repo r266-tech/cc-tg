@@ -33,7 +33,7 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 from constants import PROJECT, STATE_DIR
-from cc import CC, VENV_PYTHON
+from engine import VENV_PYTHON, make_engine
 from media import image_to_base64, understand_video  # noqa: F401  (image_to_base64 unused now; kept for parity)
 import sidebar_events
 import sidebar_history
@@ -135,7 +135,7 @@ Sidepanel UI 渲染 GFM markdown 全集 (代码块语法高亮 / 表格 / 列表
 
 # ── CC instance ───────────────────────────────────────────────────────
 
-cc = CC(
+cc = make_engine(
     state_file=STATE_DIR / f"{PROJECT}-sidebar-session.json",
     source_prompt=_SIDEBAR_SOURCE_PROMPT,
     mcp_servers={
@@ -147,7 +147,7 @@ cc = CC(
 )
 
 # Proactive CC — V 切 tab 触发, 单独 session 文件不污染主 chat.
-proactive_cc = CC(
+proactive_cc = make_engine(
     state_file=STATE_DIR / f"{PROJECT}-sidebar-proactive-session.json",
     source_prompt=_PROACTIVE_PROMPT,
     mcp_servers={

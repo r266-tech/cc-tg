@@ -49,7 +49,17 @@ from telegram.ext import (
 )
 
 from bridge import bridge
-from cc import Event, LiveSession, Response, VENV_PYTHON
+from cc import Event, LiveSession, Response
+from engine import (
+    VENV_PYTHON,
+    engine_choices,
+    engine_label,
+    engine_name,
+    is_codex_engine,
+    make_engine,
+    normalize_engine,
+    persist_engine,
+)
 from media import image_to_base64, transcribe_voice, understand_video
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -110,10 +120,8 @@ _TG_SOURCE_PROMPT = (
     "Max 4096 chars/message."
 )
 
-cc = LiveSession(
-    state_file=SESSION_FILE,
-    source_prompt=_TG_SOURCE_PROMPT,
-    mcp_servers={
+def _tg_mcp_servers() -> dict[str, Any]:
+    return {
         "tg": {
             "command": VENV_PYTHON,
             "args": [_TG_MCP_SCRIPT],
@@ -121,8 +129,51 @@ cc = LiveSession(
             # merges this with inherited env when spawning stdio MCP servers.
             "env": {"BABATA_BRIDGE_SOCKET": BRIDGE_SOCKET},
         },
-    },
-)
+    }
+
+
+def _make_tg_engine(target: str | None = None) -> LiveSession:
+    return make_engine(
+        state_file=SESSION_FILE,
+        source_prompt=_TG_SOURCE_PROMPT,
+        mcp_servers=_tg_mcp_servers(),
+        live=True,
+        engine=target,
+    )
+
+
+def _current_cpu_name() -> str:
+    name = getattr(cc, "_babata_engine_name", None)
+    if isinstance(name, str) and name:
+        return normalize_engine(name)
+    return engine_name(SESSION_FILE)
+
+
+def _bot_commands_for_cpu(cpu: str | None = None) -> list[tuple[str, str]]:
+    name = normalize_engine(cpu or _current_cpu_name())
+    commands = [
+        ("new", "Start a fresh session"),
+        ("resume", "Resume a recent session"),
+        ("status", "Show model, session, verbose"),
+        ("verbose", "Tool display: 0=hidden 1=flash 2=keep"),
+        ("cpu", "Switch assistant CPU"),
+        ("restart", "Restart this bot process"),
+    ]
+    if name == "claude":
+        commands.insert(3, ("context", "Context usage breakdown"))
+        commands.insert(6, ("stop", "Interrupt current turn"))
+        commands.append(("provider", "切换 Anthropic 渠道"))
+    return commands
+
+
+async def _sync_bot_commands(bot_obj: Any) -> None:
+    try:
+        await bot_obj.set_my_commands(_bot_commands_for_cpu())
+    except Exception as e:
+        log.warning("bot command sync failed: %s", e)
+
+
+cc = _make_tg_engine()
 _channel_worker: "ChannelWorker | None" = None
 
 # ── Graceful shutdown ─────────────────────────────────────────────────
@@ -297,9 +348,25 @@ def _load_state() -> dict:
         return {}
 
 
+_BOT_STATE_KEYS = {
+    "verbose",
+    "session_cost",
+    "session_turns",
+    "last_cost",
+    "last_used_tokens",
+    "last_model",
+    "last_context_window",
+    "last_session_id",
+}
+
+
 def _save_state() -> None:
     try:
-        _STATE_PATH.write_text(json.dumps(_state))
+        merged = _load_state()
+        for key in _BOT_STATE_KEYS:
+            if key in _state:
+                merged[key] = _state[key]
+        _STATE_PATH.write_text(json.dumps(merged))
     except Exception:
         pass
 
@@ -1792,6 +1859,21 @@ def _sdk_version() -> str:
         return "—"
 
 
+def _codex_version() -> str:
+    cli = (
+        os.environ.get("BABATA_CODEX_CLI_PATH")
+        or os.environ.get("CODEX_CLI_PATH")
+        or shutil.which("codex")
+    )
+    if not cli:
+        return "—"
+    try:
+        r = subprocess.run([cli, "--version"], capture_output=True, text=True, timeout=3)
+        return r.stdout.strip().split()[-1] if r.stdout else "—"
+    except Exception:
+        return "—"
+
+
 # ── Status: quota / today cost / formatting helpers ──────────────────
 #
 # V's terminal CC /status shows:
@@ -2122,6 +2204,25 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _allowed(update):
         return
 
+    if _current_cpu_name() == "codex":
+        actual = _last_model or os.environ.get("BABATA_CODEX_MODEL") or "codex"
+        fallback_used = _last_used_tokens if _last_session_id == cc._session_id else 0
+        used_line = f"{_fmt_tok(fallback_used)} last turn" if fallback_used else "tokens —"
+        sids = cc._load_state().get("recent_sids") or []
+        sid_now = cc._session_id if cc._session_id else "(new)"
+        labels = {0: "hidden", 1: "flash", 2: "keep"}
+        lines = [
+            "<b>📊 Status</b>",
+            "",
+            f"{html.escape(_short_model(actual))} · {used_line}",
+            "",
+            f"Codex v{_codex_version()} · {labels.get(_verbose, _verbose)}",
+            f"<code>{html.escape(actual)}</code>",
+            f"<code>{sid_now}</code> · {len(sids)} recent",
+        ]
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        return
+
     # Config-level model (what settings.json asks for — may be alias like "opus[1m]").
     # Differs from actual model name SDK reports (resolved full version).
     cfg_model = "—"
@@ -2286,6 +2387,9 @@ async def cmd_context(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """TG /context — query the live SDK context-usage control API."""
     if not _allowed(update):
         return
+    if _current_cpu_name() != "claude":
+        await update.message.reply_text("当前 CPU 是 Codex，/context 不支持。")
+        return
 
     wait_msg = await update.message.reply_text("查询中…")
     try:
@@ -2347,11 +2451,125 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # Infrastructure-touching command: fail-closed even if ALLOWED_USER==0 (开发态后门).
     if not ALLOWED_USER or not (update.effective_user and update.effective_user.id == ALLOWED_USER):
         return
+    if _current_cpu_name() != "claude":
+        await update.message.reply_text("当前 CPU 是 Codex，/stop 不支持；cut-in 会排队到当前 turn 结束后处理。")
+        return
     try:
         await _worker().interrupt()
         await update.message.reply_text("⏸  当前 turn 已请求中断")
     except Exception as e:
         await update.message.reply_text(f"/stop 失败: {type(e).__name__}: {e}")
+
+
+def _reset_status_for_cpu_switch() -> None:
+    global _session_cost, _session_turns, _last_model, _last_context_window
+    global _last_used_tokens, _last_cost, _last_session_id
+    _session_cost = 0.0
+    _session_turns = 0
+    _last_model = None
+    _last_context_window = None
+    _last_used_tokens = 0
+    _last_cost = 0.0
+    _last_session_id = None
+    _state["session_cost"] = 0.0
+    _state["session_turns"] = 0
+    _state["last_cost"] = 0.0
+    _state["last_used_tokens"] = 0
+    for key in ("last_model", "last_context_window", "last_session_id"):
+        _state.pop(key, None)
+
+
+async def _switch_cpu(target: str) -> str:
+    global cc, _channel_worker
+    target_name = normalize_engine(target)
+    current_name = _current_cpu_name()
+    if target_name == current_name:
+        return f"CPU 已经是 {engine_label(target_name)}"
+    worker = _channel_worker
+    if _in_flight > 0 or (worker is not None and worker._turn_active):
+        raise RuntimeError(f"当前还有 {_in_flight or 1} 个 turn 在跑，等结束后再 /cpu")
+
+    # Older state files only have one top-level session_id. Snapshot the
+    # current CPU's sid into the per-engine slot before the top-level value can
+    # be replaced by the target CPU.
+    if hasattr(cc, "_record_sid"):
+        with suppress(Exception):
+            cc._record_sid(getattr(cc, "_session_id", None))
+
+    new_cc = _make_tg_engine(target_name)
+    new_worker = ChannelWorker(new_cc, instance_label=_CURRENT_LABEL)
+    old_worker = _channel_worker
+
+    if old_worker is not None:
+        await old_worker.stop()
+    try:
+        await new_worker.start()
+    except Exception:
+        log.exception("CPU switch failed; restoring %s", current_name)
+        with suppress(Exception):
+            restore_cc = _make_tg_engine(current_name)
+            restore_worker = ChannelWorker(restore_cc, instance_label=_CURRENT_LABEL)
+            await restore_worker.start()
+            cc = restore_cc
+            _channel_worker = restore_worker
+        raise
+
+    cc = new_cc
+    _channel_worker = new_worker
+    persist_engine(SESSION_FILE, target_name)
+    _reset_status_for_cpu_switch()
+    _save_state()
+    return f"CPU: {engine_label(current_name)} → {engine_label(target_name)}"
+
+
+async def cmd_cpu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Switch the assistant CPU for this TG process."""
+    # Engine-changing command: fail-closed even if ALLOWED_USER==0 (开发态后门).
+    if not ALLOWED_USER or not (update.effective_user and update.effective_user.id == ALLOWED_USER):
+        return
+
+    args = (update.message.text or "").split(maxsplit=1)
+    if len(args) > 1 and args[1].strip():
+        wait_msg = await update.message.reply_text("切换 CPU 中…")
+        try:
+            body = await _switch_cpu(args[1].strip())
+            await _sync_bot_commands(ctx.bot)
+            await wait_msg.edit_text(body)
+        except Exception as e:
+            await wait_msg.edit_text(f"/cpu 失败: {type(e).__name__}: {e}")
+        return
+
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    current = _current_cpu_name()
+    buttons = [
+        [InlineKeyboardButton(
+            f"{'● ' if key == current else '○ '}{label}",
+            callback_data=f"cpu:{key}",
+        )]
+        for label, key in engine_choices()
+    ]
+    await update.message.reply_text(
+        f"CPU (当前: {engine_label(current)}):",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def on_cpu_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not await _callback_allowed(q):
+        return
+    await q.answer()
+    data = q.data or ""
+    if ":" not in data:
+        return
+    _, target = data.split(":", 1)
+    try:
+        await q.edit_message_text("切换 CPU 中…")
+        body = await _switch_cpu(target)
+        await _sync_bot_commands(ctx.bot)
+        await q.edit_message_text(body)
+    except Exception as e:
+        await q.edit_message_text(f"/cpu 失败: {type(e).__name__}: {e}")
 
 
 # cc-router 是可选外部服务 (V 私人多 Anthropic 账号切换). 没设 BABATA_CC_ROUTER_DIR
@@ -2422,6 +2640,9 @@ async def cmd_provider(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """
     # Infrastructure-changing command: fail-closed even if ALLOWED_USER==0 (开发态后门).
     if not ALLOWED_USER or not (update.effective_user and update.effective_user.id == ALLOWED_USER):
+        return
+    if _current_cpu_name() != "claude":
+        await update.message.reply_text("当前 CPU 是 Codex，/provider 不生效；先 /cpu claude 再切 Anthropic 渠道。")
         return
 
     args = (update.message.text or "").split(maxsplit=1)
@@ -2978,16 +3199,7 @@ async def _post_init(app: Application) -> None:
     # Graceful shutdown: 覆盖 PTB/asyncio 默认 signal handler, 等 live turn
     # 跑完再退 (cmd_restart / launchd SIGTERM / Ctrl+C 都走这条).
     _install_signal_handlers(app)
-    await app.bot.set_my_commands([
-        ("new", "Start a fresh session"),
-        ("resume", "Resume a recent session"),
-        ("status", "Show model, session, verbose"),
-        ("context", "Context usage breakdown"),
-        ("verbose", "Tool display: 0=hidden 1=flash 2=keep"),
-        ("stop", "Interrupt current turn"),
-        ("restart", "Restart this bot process"),
-        ("provider", "切换 Anthropic 渠道"),
-    ])
+    await _sync_bot_commands(app.bot)
 
     # 意外重启 / launchd kickstart / 任务中 /restart → bot 重连后主动告知 V 当
     # 前 session 号. 不走 hook (hook 只在 session 边界触发, bot 重启时 sid 没变).
@@ -3042,12 +3254,14 @@ def main() -> None:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("context", cmd_context))
     app.add_handler(CommandHandler("verbose", cmd_verbose))
+    app.add_handler(CommandHandler("cpu", cmd_cpu))
     app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("restart", cmd_restart))
     app.add_handler(CommandHandler("provider", cmd_provider))
     app.add_handler(CommandHandler("new", on_text))
     app.add_handler(CallbackQueryHandler(on_verbose_click, pattern=r"^verbose:"))
+    app.add_handler(CallbackQueryHandler(on_cpu_click, pattern=r"^cpu:"))
     app.add_handler(CallbackQueryHandler(on_provider_click, pattern=r"^provider:"))
     # resume-ch: / resume-back / resume: 三个 pattern 互斥 (第 7 字符不同),
     # 注册顺序无关紧要; 仍按 specific → generic 排列利于阅读.
