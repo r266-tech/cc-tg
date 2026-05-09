@@ -39,5 +39,6 @@ py-modules = [
     "bot", "bridge", "cc", "constants", "media",
     "tg_mcp", "weixin_account", "weixin_bot",
     "weixin_bridge", "weixin_ilink", "weixin_mcp",
-    "sidebar_bot", "sidebar_bridge", "sidebar_mcp",
+    "sidebar_bot", "sidebar_bridge", "sidebar_events",
+    "sidebar_history", "sidebar_mcp", "sidebar_translate",
 ]
