@@ -31,6 +31,19 @@ unset UV_INDEX_URL PIP_INDEX_URL UV_EXTRA_INDEX_URL PIP_EXTRA_INDEX_URL 2>/dev/n
 # Path derivation. SCRIPT_DIR = repo root (this file lives at repo/auto-update.sh).
 # Works from any install location: ~/code/babata, ~/projects/mybot, etc.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Pull just PROJECT_STATE_DIR from .env so the restart-reason file lands
+# where bot.py's load_dotenv() makes it look. Avoid `source .env` because
+# it would blanket-export TG/API tokens into every subprocess this script
+# spawns (git fetch, uv, claude update, etc.) — wider secrets surface than
+# necessary. Caller-set PROJECT_STATE_DIR (env / plist) takes precedence.
+ENV_FILE="$SCRIPT_DIR/.env"
+if [ -f "$ENV_FILE" ] && [ -z "${PROJECT_STATE_DIR:-}" ]; then
+    PROJECT_STATE_DIR=$(grep -m1 '^PROJECT_STATE_DIR=' "$ENV_FILE" 2>/dev/null \
+        | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '\r')
+    [ -n "$PROJECT_STATE_DIR" ] && export PROJECT_STATE_DIR
+fi
+
 PROJECT_NAMESPACE="${PROJECT_NAMESPACE:-babata}"
 LABEL_PREFIX="com.${PROJECT_NAMESPACE}"
 
@@ -103,8 +116,26 @@ if [ "$OLD_CLI" != "$NEW_CLI" ] || [ "$OLD_SDK" != "$NEW_SDK" ]; then
     if [ -z "$LABELS" ]; then
         echo "WARNING: no running ${LABEL_PREFIX}* agents, nothing to restart"
     else
+        # Restart reason channel: bot.py reads STATE_DIR/restart-reason-{label}.txt
+        # at graceful shutdown (or startup) and surfaces it in the TG alert.
+        # STATE_DIR = constants.py default (PROJECT_STATE_DIR env or repo-local state/).
+        STATE_DIR_R="${PROJECT_STATE_DIR:-$SCRIPT_DIR/state}"
+        mkdir -p "$STATE_DIR_R"
+        reason_parts=""
+        [ "$OLD_CLI" != "$NEW_CLI" ] && reason_parts="CLI $OLD_CLI→$NEW_CLI"
+        if [ "$OLD_SDK" != "$NEW_SDK" ]; then
+            [ -n "$reason_parts" ] && reason_parts="$reason_parts, "
+            reason_parts="${reason_parts}SDK $OLD_SDK→$NEW_SDK"
+        fi
+        REASON="auto-update: $reason_parts"
+
         echo "Changes detected, restarting: $(echo $LABELS | tr '\n' ' ')"
         for label in $LABELS; do
+            # Skip wx label: weixin_bot has no TG alert consumer for the
+            # restart-reason channel (file write would be unread).
+            if [ "$label" != "${LABEL_PREFIX}.weixin" ]; then
+                printf '%s\n' "$REASON" > "$STATE_DIR_R/restart-reason-${label}.txt"
+            fi
             if launchctl kickstart -k "gui/$(id -u)/$label" 2>&1; then
                 echo "  ok   $label"
             else

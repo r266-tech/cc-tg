@@ -86,6 +86,7 @@ class WeixinBridge:
                 "send_image": self._handle_send_image,
                 "send_video": self._handle_send_video,
                 "send_file": self._handle_send_file,
+                "send_voice": self._handle_send_voice,
                 "send_typing": self._handle_send_typing,
             }
             handler = handlers.get(action)
@@ -195,6 +196,14 @@ class WeixinBridge:
             build_item_args=(file_name,),
         )
         await self._respond(writer, f"File sent: {file_name}")
+
+    async def _handle_send_voice(self, request, writer) -> None:
+        """Voice send permanently disabled — see weixin_mcp.py 同名注释 verdict."""
+        await self._respond(
+            writer,
+            "Error: ilink protocol filters bot→user voice (verified 2026-04-26 "
+            "via 13 wire variants + Java SDK live test live HTTP wire dump)",
+        )
 
     async def _handle_send_typing(self, request, writer) -> None:
         status = int(request.get("status", 1))

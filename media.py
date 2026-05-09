@@ -5,6 +5,7 @@ import base64
 import logging
 import os
 import re
+import shutil
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -18,7 +19,7 @@ _MEDIA_TYPES = {
 }
 
 _STT_MODEL = os.environ.get("STT_MODEL", "mimo-v2-omni")
-_STT_PROMPT = os.environ.get("STT_PROMPT", "转录这段语音, 只输出文本, 不要解释。")
+_STT_PROMPT = os.environ.get("STT_PROMPT", "转录这段语音, 中文用简体, 只输出文本, 不要解释。")
 _STT_LOCAL_MODEL = os.environ.get("STT_LOCAL_MODEL", "base")  # tiny/base/small/medium/large-v3
 _local_whisper = None  # lazy singleton — init cost ~1-3s, model download ~150MB first run
 
@@ -39,7 +40,9 @@ async def _stt_local(wav_path: Path) -> str:
     def _do_transcribe() -> str:
         # language=None → 自动检测; faster-whisper 中英 detect 都准. transcribe 是 sync,
         # 必须丢 executor, 不然 base model 几秒解码会卡 event loop (TG long-poll 会 timeout).
-        segments, _info = _local_whisper.transcribe(str(wav_path), language=None)
+        segments, _info = _local_whisper.transcribe(
+            str(wav_path), language=None, initial_prompt=_STT_PROMPT
+        )
         return "".join(s.text for s in segments).strip()
 
     return await loop.run_in_executor(None, _do_transcribe)
@@ -84,8 +87,12 @@ async def _stt_wav(wav_path: Path) -> str:
         return content
 
 
-async def transcribe_voice(ogg_path: Path) -> str:
-    """TG OGG voice → text via ffmpeg + MiMo. Fail loud, no fallback."""
+async def transcribe_voice(ogg_path: Path, keep_wav: Path | None = None) -> str:
+    """TG OGG voice → text via ffmpeg + MiMo. Fail loud, no fallback.
+
+    keep_wav: 非 None 时把 16kHz mono WAV 在 STT 完成后复制到该路径 (不影响 STT 行为).
+    voice-clone skill 用此机制让 CC 拿到 wav 路径做声音克隆.
+    """
     wav_path = ogg_path.with_suffix(".wav")
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -97,7 +104,18 @@ async def transcribe_voice(ogg_path: Path) -> str:
         _, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
         if proc.returncode != 0 or not wav_path.exists():
             raise RuntimeError(f"ffmpeg 转码失败: {stderr.decode()[:200]}")
-        return await _stt_wav(wav_path)
+        text = await _stt_wav(wav_path)
+        if keep_wav is not None:
+            # 失败不影响 STT 主路径 (caller 的合约只是拿 text). 用 .partial → os.replace
+            # 原子化, 防外部 watcher 读到半文件. 任何异常 log warning 后吞掉.
+            try:
+                keep_wav.parent.mkdir(parents=True, exist_ok=True)
+                tmp = keep_wav.with_suffix(keep_wav.suffix + ".partial")
+                shutil.copy2(wav_path, tmp)
+                os.replace(tmp, keep_wav)
+            except Exception as e:
+                log.warning("voice-clone keep_wav failed: %s (STT preserved)", e)
+        return text
     finally:
         wav_path.unlink(missing_ok=True)
 

@@ -58,6 +58,116 @@ VENV_PYTHON = str(Path(__file__).parent / ".venv" / "bin" / "python")
 
 _CC_PROJECTS = Path.home() / ".claude" / "projects" / str(Path.home()).replace("/", "-")
 
+
+def _find_jsonl_any_bucket(sid: str) -> Path | None:
+    """Locate <sid>.jsonl across all ~/.claude/projects/<cwd-hash>/ buckets.
+
+    babata 默认 cwd=$HOME, 单 bucket 看到的只是 V 在 $HOME 跑 claude 那批 session.
+    V 在 ~/code/foo 跑 claude 的 session 落在 -Users-admin-code-foo/ 别的 bucket,
+    list_recent_sessions(scan_all_buckets=True) 会列出来; 但实际 resume / 读 turn
+    时还得跨 bucket 找文件 — 这里就做这个查找.
+
+    Read-only — 不动文件. resume 路径要把文件 copy 到 babata bucket 才能让 SDK
+    --resume 找到 (CLI cwd-bound), 走 _import_jsonl_to_bucket.
+    """
+    target = _CC_PROJECTS / f"{sid}.jsonl"
+    if target.is_file():
+        return target
+    projects_root = _CC_PROJECTS.parent
+    try:
+        for bucket in projects_root.iterdir():
+            if not bucket.is_dir() or bucket == _CC_PROJECTS:
+                continue
+            candidate = bucket / f"{sid}.jsonl"
+            if candidate.is_file():
+                return candidate
+    except Exception:
+        pass
+    return None
+
+
+def _import_jsonl_to_bucket(source_sid: str) -> str | None:
+    """Resolve <source_sid>.jsonl to a sid that lives in babata's bucket.
+
+    源文件已在 babata bucket → 直接返回 source_sid (no copy, no fork).
+    源文件在别的 cwd-bucket (V 在终端别处开的原生 CC) → fork: 用 *新 uuid*
+    复制到 babata bucket, 返回新 sid. 关键设计:
+      - 新 uuid 避免 sid 冲突: 原 sid 在源 bucket 不动, V 在原 cwd 终端继续
+        resume 同一个 sid 仍能续上, 跟 babata 这边的 fork 物理隔离 不会
+        silent diverge (Codex A-FORK).
+      - SDK --resume <new_sid> 能找到 (CLI cwd-bound, 文件在 babata bucket).
+    并发安全:
+      - per-source-sid flock 防多 babata 实例同时 import 写花文件 (Codex C-CONCURRENCY)
+      - 写 .tmp + os.replace 原子化, 中途 crash 不留半文件
+      - 末行 JSON 校验 — 源文件可能正被终端 session 追加 (Codex H-RACE),
+        最后一行不完整就 trim 掉
+    """
+    own = _CC_PROJECTS / f"{source_sid}.jsonl"
+    if own.is_file():
+        return source_sid
+    src = _find_jsonl_any_bucket(source_sid)
+    if src is None:
+        return None
+
+    import fcntl
+    import shutil
+    import uuid
+
+    new_sid = str(uuid.uuid4())
+    new_target = _CC_PROJECTS / f"{new_sid}.jsonl"
+    tmp_path = _CC_PROJECTS / f".{new_sid}.jsonl.tmp"
+    lock_path = _CC_PROJECTS / f".import-{source_sid}.lock"
+    lock_f = None
+    try:
+        _CC_PROJECTS.mkdir(parents=True, exist_ok=True)
+        lock_f = open(lock_path, "w")
+        fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+        # Re-check after acquiring lock (another babata instance may have just
+        # finished an unrelated import — irrelevant since we use a fresh uuid,
+        # but cheap belt-and-suspenders).
+        if own.is_file():
+            return source_sid
+        shutil.copy2(src, tmp_path)
+        # 末行 JSON 校验. shutil.copy2 是单次 read+write — 若源 bucket 终端
+        # session 正 append, 末行可能截断. 不能 parse 就 trim.
+        try:
+            content = tmp_path.read_bytes()
+            if content and not content.endswith(b"\n"):
+                # Last line not newline-terminated; treat as in-progress write.
+                last_nl = content.rfind(b"\n")
+                if last_nl >= 0:
+                    tmp_path.write_bytes(content[: last_nl + 1])
+                else:
+                    # Single incomplete line — drop to empty rather than corrupt.
+                    tmp_path.write_bytes(b"")
+            else:
+                # Validate last line parses as JSON; if not, trim it.
+                lines = content.splitlines()
+                if lines:
+                    try:
+                        json.loads(lines[-1])
+                    except Exception:
+                        tmp_path.write_bytes(b"\n".join(lines[:-1]) + (b"\n" if lines[:-1] else b""))
+        except Exception:
+            pass
+        with open(tmp_path, "rb") as t:
+            os.fsync(t.fileno())
+        os.replace(tmp_path, new_target)
+        return new_sid
+    except Exception as e:
+        log.warning("import jsonl %s from %s failed: %s", source_sid, src.parent.name, e)
+        with suppress(Exception):
+            tmp_path.unlink()
+        return None
+    finally:
+        if lock_f is not None:
+            with suppress(Exception):
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+            with suppress(Exception):
+                lock_f.close()
+        with suppress(Exception):
+            lock_path.unlink()
+
 # 默认隔离 — 不读用户 ~/.claude/{settings.json, CLAUDE.md, skills/}, 不动 OAuth keychain.
 # 用户日常 CC 完全无感. 开源用户走这条 (.env 必须有 ANTHROPIC_API_KEY).
 # V 私人 .env 设 BABATA_SHARED_CC=1 → 共享用户 CC 全套 (skill / settings / OAuth), 跟之前体验一致.
@@ -65,10 +175,10 @@ _SETTING_SOURCES: list[str] = ["user"] if os.environ.get("BABATA_SHARED_CC") == 
 
 # 默认信任边界 — babata 容器化 default: cwd 限定 repo 自身 (不让 babata access 用户整个家),
 # permission_mode 走 "default" (重要 tool call 提示授权, 不静默 bypass).
-# V 私人 .env 设 BABATA_FULL_TRUST=1 → cwd=~/ + bypassPermissions, 跟之前 V 体验一致.
+# V 私人 .env 设 BABATA_FULL_TRUST=1 → cwd=~/ + auto mode (官方支持, status "auto mode on").
 _FULL_TRUST = os.environ.get("BABATA_FULL_TRUST") == "1"
 _DEFAULT_CWD = str(Path.home()) if _FULL_TRUST else str(Path(__file__).parent)
-_PERMISSION_MODE = "bypassPermissions" if _FULL_TRUST else "default"
+_PERMISSION_MODE = "auto" if _FULL_TRUST else "default"
 
 # _STATE_DIR: all channel state files land here. Cross-channel session picker
 # scans this dir, so it's a soft coupling — cc.py isn't fully channel-agnostic
@@ -174,8 +284,8 @@ def _spawn_summary_generation(sid: str, source_mtime: float) -> None:
     调用方不等结果 — 本次 /resume 仍用 first_user fallback, 下次 /resume 命中缓存.
     Haiku 一句话总结典型 1-3 秒, 10 session 并发大约 3-5 秒写完缓存.
     """
-    jsonl = _CC_PROJECTS / f"{sid}.jsonl"
-    if not jsonl.is_file():
+    jsonl = _find_jsonl_any_bucket(sid)
+    if jsonl is None:
         return
 
     def worker() -> None:
@@ -200,7 +310,7 @@ def _spawn_summary_generation(sid: str, source_mtime: float) -> None:
             result = subprocess.run(
                 [cli, "-p", prompt,
                  "--output-format", "text",
-                 "--permission-mode", "bypassPermissions"],
+                 "--permission-mode", "auto"],
                 capture_output=True, text=True, timeout=60,
                 cwd=str(_SUMMARY_SANDBOX),
             )
@@ -513,6 +623,7 @@ class CC:
 
     def list_recent_sessions(
         self, limit: int = 10, channel_filter: list[str] | None = None,
+        scan_all_buckets: bool = False,
     ) -> list[dict]:
         """Return recent sessions for `/resume` picker — 跨渠道可见.
 
@@ -541,11 +652,36 @@ class CC:
         summary_cache = _load_summary_cache()
         own_channel = _channel_label_from_state_file(self._state_file)
         try:
-            files = sorted(
-                _CC_PROJECTS.glob("*.jsonl"),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            )
+            if scan_all_buckets:
+                # 跨 cwd bucket 扫 — V 在终端不同目录开的 claude session 落在
+                # 不同 bucket (~/.claude/projects/<cwd-hash>/), 单 bucket 扫只
+                # 看得见 babata 自己 cwd 那个. "终端"/"一次性" 渠道用全局视图,
+                # V 不用记自己当时在哪个目录敲的 claude.
+                # 排除 summary subprocess 的 sandbox bucket — 那里全是 babata
+                # 内部 "用一句话总结..." 的 sdk-cli 调用, 不是 V 真正的 oneshot.
+                # 用 realpath 防 _SUMMARY_SANDBOX 路径里有 symlink 时跟 CC CLI
+                # 用 realpath 算 bucket name 不一致 (Codex F-SANDBOX-EXCLUSION).
+                projects_root = _CC_PROJECTS.parent
+                try:
+                    sandbox_real = str(_SUMMARY_SANDBOX.resolve())
+                except Exception:
+                    sandbox_real = str(_SUMMARY_SANDBOX)
+                sandbox_bucket_name = sandbox_real.replace("/", "-")
+                buckets = [
+                    b for b in projects_root.iterdir()
+                    if b.is_dir() and b.name != sandbox_bucket_name
+                ]
+                files = sorted(
+                    (fp for b in buckets for fp in b.glob("*.jsonl")),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+            else:
+                files = sorted(
+                    _CC_PROJECTS.glob("*.jsonl"),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
         except Exception:
             return []
 
@@ -584,15 +720,6 @@ class CC:
             except Exception:
                 mtime = 0.0
 
-            # Summary cache: 按 jsonl mtime 失效. 命中用缓存, miss/过期后台生成
-            # + 本次 fallback first_user. 下次 /resume 就能看见总结.
-            cached = summary_cache.get(sid)
-            if cached and cached.get("source_mtime") == mtime:
-                preview = cached.get("summary") or first_user
-            else:
-                preview = first_user
-                _spawn_summary_generation(sid, mtime)
-
             owners = peer_map.get(sid, [])
             if owners:
                 channel_label = owners[0]
@@ -604,8 +731,19 @@ class CC:
                 channel_label = "term"
 
             # channel_filter 白名单过滤. 'term'/'oneshot' 匹配 "无 owner" 的 orphan.
+            # 在 summary spawn 之前过滤, 避免 scan_all_buckets 模式下给被丢弃的
+            # session 起 haiku 总结 (Codex E-PERF).
             if channel_filter is not None and channel_label not in channel_filter:
                 continue
+
+            # Summary cache: 按 jsonl mtime 失效. 命中用缓存, miss/过期后台生成
+            # + 本次 fallback first_user. 下次 /resume 就能看见总结.
+            cached = summary_cache.get(sid)
+            if cached and cached.get("source_mtime") == mtime:
+                preview = cached.get("summary") or first_user
+            else:
+                preview = first_user
+                _spawn_summary_generation(sid, mtime)
 
             is_own = own_channel in owners
             out.append({
@@ -622,23 +760,27 @@ class CC:
         return out
 
     def resume(self, sid: str) -> bool:
-        """Switch active session to `sid`. False if JSONL missing.
+        """Switch active session to `sid` (or its forked counterpart). False if JSONL missing.
 
-        Bumps the sid to the front of recent_sids (same rule as a fresh
-        ResultMessage would), so subsequent /status / /resume lists see it as
-        most-recent. Skill-evolve hooks: skipped (pointer switch inside an
-        ongoing channel, not a skill-tracked session boundary). Babata-local
-        hooks: fired — V wants /resume to also announce the new sid on TG.
+        Bumps the active sid to the front of recent_sids. Skill-evolve hooks:
+        skipped (pointer switch). Babata-local hooks: fired.
+
+        Cross-bucket fork: 若 sid 文件在别的 cwd-bucket, _import_jsonl_to_bucket
+        会用 *新 uuid* 复制一份到 babata bucket 并返回新 sid; 这里把 self._session_id
+        切到新 sid (不是原 sid), 保证 babata 后续 turn 写新 sid 文件, 不跟原 sid
+        在源 bucket 的状态分叉. 调用方 (bot.py /resume callback) 看 self._session_id
+        知道 fork 后真正激活的 sid.
         """
-        if not (_CC_PROJECTS / f"{sid}.jsonl").is_file():
+        resolved = _import_jsonl_to_bucket(sid)
+        if resolved is None:
             return False
         old_sid = self._session_id
-        self._session_id = sid
-        self._record_sid(sid)
-        if old_sid != sid:
+        self._session_id = resolved
+        self._record_sid(resolved)
+        if old_sid != resolved:
             if old_sid:
                 self._fire_hook(_HOOKS_DIR, "session-end.sh", old_sid)
-            self._fire_hook(_HOOKS_DIR, "session-start.sh", sid)
+            self._fire_hook(_HOOKS_DIR, "session-start.sh", resolved)
         return True
 
     def get_recent_turns(
@@ -660,8 +802,8 @@ class CC:
         into — selecting by 48-char first-user preview isn't enough to tell
         two nearby threads apart.
         """
-        fp = _CC_PROJECTS / f"{sid}.jsonl"
-        if not fp.is_file():
+        fp = _find_jsonl_any_bucket(sid)
+        if fp is None:
             return []
         collected: list[tuple[str, str]] = []
         try:
@@ -1082,9 +1224,8 @@ class LiveSession(CC):
         return Response(content="会话已重置。", session_id="", cost=0.0)
 
     async def resume_live(self, sid: str) -> bool:
-        """Async /resume: move state pointer, then reconnect CLI with --resume."""
-        if not (_CC_PROJECTS / f"{sid}.jsonl").is_file():
-            return False
+        """Async /resume: move state pointer (with fork-on-import if cross-bucket),
+        then reconnect CLI with --resume."""
         async with self._connect_lock:
             ok = super().resume(sid)
             if not ok:

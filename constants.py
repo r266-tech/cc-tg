@@ -49,10 +49,11 @@ def _label(key: str, default: str) -> str:
     return os.environ.get(env_key, default)
 
 INSTANCE_LABELS: dict[str, str] = {
-    "":       _label("",       "babata"),
-    "vvv":    _label("vvv",    "babata2"),
-    "vvvv":   _label("vvvv",   "babata3"),
-    "weixin": _label("weixin", "wx"),
+    "":        _label("",        "babata"),
+    "vvv":     _label("vvv",     "babata2"),
+    "vvvv":    _label("vvvv",    "babata3"),
+    "weixin":  _label("weixin",  "wx"),
+    "sidebar": _label("sidebar", "sidebar"),
 }
 
 # Files / sockets derived from NAMESPACE. Modules import these rather than

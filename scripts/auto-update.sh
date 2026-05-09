@@ -9,6 +9,15 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR"
 
+# Pull just PROJECT_STATE_DIR from .env (avoid blanket-exporting tokens
+# to subprocess). Caller-set PROJECT_STATE_DIR wins.
+ENV_FILE="$SCRIPT_DIR/.env"
+if [ -f "$ENV_FILE" ] && [ -z "${PROJECT_STATE_DIR:-}" ]; then
+    PROJECT_STATE_DIR=$(grep -m1 '^PROJECT_STATE_DIR=' "$ENV_FILE" 2>/dev/null \
+        | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '\r')
+    [ -n "$PROJECT_STATE_DIR" ] && export PROJECT_STATE_DIR
+fi
+
 PROJECT_NAMESPACE="${PROJECT_NAMESPACE:-babata}"
 LABEL="com.${PROJECT_NAMESPACE}"
 SERVICE="${PROJECT_NAMESPACE}.service"
@@ -70,6 +79,20 @@ fi
 
 # 4) 重启 service (代码 / deps / cli 任一变了)
 if [ "$CODE_CHANGED" = "1" ] || [ "$DEPS_CHANGED" = "1" ] || [ "$CLI_CHANGED" = "1" ]; then
+    # Build a one-line reason for bot.py's restart-reason channel — V 看到的
+    # TG alert 会拼上这串, 知道为啥重启 (而不是空洞的 "launchd 自愈").
+    reason_parts=""
+    [ "$CODE_CHANGED" = "1" ] && reason_parts="code"
+    if [ "$DEPS_CHANGED" = "1" ]; then
+        [ -n "$reason_parts" ] && reason_parts="$reason_parts+"
+        reason_parts="${reason_parts}deps"
+    fi
+    if [ "$CLI_CHANGED" = "1" ]; then
+        [ -n "$reason_parts" ] && reason_parts="$reason_parts+"
+        reason_parts="${reason_parts}cli"
+    fi
+    REASON="auto-update (scripts/): $reason_parts"
+
     case "$(uname -s)" in
         Linux)
             if command -v systemctl >/dev/null 2>&1; then
@@ -78,6 +101,9 @@ if [ "$CODE_CHANGED" = "1" ] || [ "$DEPS_CHANGED" = "1" ] || [ "$CLI_CHANGED" = 
             ;;
         Darwin)
             if launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1; then
+                STATE_DIR_R="${PROJECT_STATE_DIR:-$SCRIPT_DIR/state}"
+                mkdir -p "$STATE_DIR_R" 2>/dev/null && \
+                    printf '%s\n' "$REASON" > "$STATE_DIR_R/restart-reason-${LABEL}.txt"
                 launchctl kickstart -k "gui/$UID/$LABEL" && echo "launchd kickstarted: $LABEL"
             fi
             ;;

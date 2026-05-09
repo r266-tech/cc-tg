@@ -192,12 +192,10 @@ def test_channel_worker_single_turn_clean_reset(monkeypatch, tmp_path):
     asyncio.run(run())
 
 
-def test_channel_worker_back_to_back_submits_finalize_in_one_turn_end(monkeypatch, tmp_path):
-    """SDK 在 V 快速连发时把多条 V msg batch 成一个 turn_end (实测).
-    新行为: turn_end 时一并 finalize 所有累积 (active + pending) marks,
-    不再 P1.4 promote 给下个 SDK turn (会卡死 in_flight).
-    Per-message reply anchor 仍生效 — text_delta 流到最新 V msg 的 reply.
-    """
+def test_channel_worker_cut_in_waits_for_next_turn(monkeypatch, tmp_path):
+    """V 快速连发: 第二条先 ack + interrupt, 但不立即 submit 进 SDK.
+    等第一条 turn_end 后, worker 才 begin_turn + submit 第二条, 避免 stale
+    interrupt 命中新 turn."""
     async def run():
         reset_bot_globals(monkeypatch, tmp_path)
         session = FakeSession()
@@ -216,24 +214,25 @@ def test_channel_worker_back_to_back_submits_finalize_in_one_turn_end(monkeypatc
             bot.Payload(update=FakeUpdate(second_msg, chat), ctx=ctx, text="more")
         )
 
-        assert session.submitted == [("hello", None), ("more", None)]
+        assert session.submitted == [("hello", None)]
         assert bot._in_flight == 1
-        # SDK turn anchor 仍是 msg1 (_begin_turn 时设的, 后续 submit 不动)
+        await wait_for(lambda: session.interrupted is True)
+        # SDK turn anchor 仍是 msg1; cut-in 不改 bridge reply_to.
         assert worker._turn_anchor == 1
-        assert bot.bridge.contexts[-1][2] == 2
+        assert bot.bridge.contexts[-1][2] == 1
 
-        # text_delta — per-message reply: 切到 second_msg (最近 submit 的 V 消息)
+        # 第一 turn 的 text/tool 继续落到 msg1, 不污染尚未开始的 msg2.
         session.queue.put_nowait(Event(kind="text_delta", chunk="Hi"))
-        await wait_for(lambda: len(second_msg.replies) == 1)
-        live_text = second_msg.replies[0]
+        await wait_for(lambda: len(first_msg.replies) == 1)
+        live_text = first_msg.replies[0]
         assert live_text.text == "Hi"
-        assert len(first_msg.replies) == 0  # first_msg 没收到 reply
+        assert len(second_msg.replies) == 0
 
         session.queue.put_nowait(
             Event(kind="tool_use", name="Read", input_dict={"file_path": "a.py"})
         )
-        await wait_for(lambda: len(second_msg.replies) == 2)
-        tool_status = second_msg.replies[1]
+        await wait_for(lambda: len(first_msg.replies) == 2)
+        tool_status = first_msg.replies[1]
         assert "Read" in tool_status.text
 
         session.queue.put_nowait(
@@ -251,13 +250,30 @@ def test_channel_worker_back_to_back_submits_finalize_in_one_turn_end(monkeypatc
                 ),
             )
         )
-        # 新行为: turn_end 后 in_flight=0, 不 promote 第二个 turn
-        await wait_for(lambda: bot._in_flight == 0)
-        # final response 编辑当前 _text_message (= second_msg.replies[0])
+        # 第一 turn_end 后立即启动第二条 queued payload.
+        await wait_for(lambda: session.submitted == [("hello", None), ("more", None)])
+        assert bot._in_flight == 1
+        assert worker._turn_anchor == 2
+        assert bot.bridge.contexts[-1][2] == 2
+        # final response 编辑第一条的 live text.
         assert live_text.edits[-1][0] == "<b>done</b>"
         assert tool_status.deleted is True
         assert bot._session_turns == 1
         assert bot._last_used_tokens == 8
+
+        session.queue.put_nowait(
+            Event(
+                kind="turn_end",
+                response=Response(
+                    content="second done",
+                    session_id="sid-2",
+                    cost=0.1,
+                ),
+            )
+        )
+        await wait_for(lambda: bot._in_flight == 0)
+        assert any("second done" in r.text for r in second_msg.replies)
+        assert bot._session_turns == 2
         assert worker._turn_active is False
 
         await worker.stop()
@@ -299,9 +315,7 @@ def test_channel_worker_reaction_eye_then_ok_single_turn(monkeypatch, tmp_path):
 
 
 def test_channel_worker_reaction_back_to_back_messages(monkeypatch, tmp_path):
-    """V 连发两条 (SDK batch 一个 turn): 第一条 👀 立即, 第二条等 turn_end.
-    新行为: turn_end 一并 fire 👌 给 [m1, m2] (因为 SDK batch 处理了两条).
-    避免 m2 卡 👀 永远 (旧 P1.4 promote 路径会卡死)."""
+    """V 连发两条: 两条都立即 👀; 每条在各自 turn_end 后 👌."""
     async def run():
         reset_bot_globals(monkeypatch, tmp_path)
         session = FakeSession()
@@ -321,12 +335,10 @@ def test_channel_worker_reaction_back_to_back_messages(monkeypatch, tmp_path):
         await worker.submit(
             bot.Payload(update=FakeUpdate(m2, chat), ctx=ctx, text="second")
         )
-        # m2 没立即 fire 👀 (等 turn_end 跟 m1 一起 fire 👌)
-        await asyncio.sleep(0.05)
-        assert (42, 2, "👀") not in ctx.bot.reactions
+        await wait_for(lambda: (42, 2, "👀") in ctx.bot.reactions)
         assert (42, 2, "👌") not in ctx.bot.reactions
 
-        # turn_end → m1 + m2 都 fire 👌 (SDK batch finalize)
+        # 第一 turn_end → 只 finalize m1, 并启动 m2 的 queued turn.
         session.queue.put_nowait(
             Event(
                 kind="turn_end",
@@ -334,9 +346,16 @@ def test_channel_worker_reaction_back_to_back_messages(monkeypatch, tmp_path):
             )
         )
         await wait_for(lambda: (42, 1, "👌") in ctx.bot.reactions)
-        await wait_for(lambda: (42, 2, "👌") in ctx.bot.reactions)
+        assert (42, 2, "👌") not in ctx.bot.reactions
+        assert bot._in_flight == 1
 
-        # in_flight 必须回 0 — promote 路径删掉, 不再卡死
+        session.queue.put_nowait(
+            Event(
+                kind="turn_end",
+                response=Response(content="ok2", session_id="sid-2", cost=0.01),
+            )
+        )
+        await wait_for(lambda: (42, 2, "👌") in ctx.bot.reactions)
         await wait_for(lambda: bot._in_flight == 0)
 
         await worker.stop()
@@ -345,8 +364,8 @@ def test_channel_worker_reaction_back_to_back_messages(monkeypatch, tmp_path):
 
 
 def test_channel_worker_new_message_reply_does_not_merge(monkeypatch, tmp_path):
-    """V 发 msg1 流式中, 又发 msg2 — msg2 进来后流式输出应该 reply 到 msg2,
-    不接着编辑 msg1 的旧 reply (per-message reply anchor)."""
+    """V 发 msg1 流式中又发 msg2: msg1 的后续输出仍在 msg1, msg2
+    等第一 turn_end 后开启自己的 reply."""
     async def run():
         reset_bot_globals(monkeypatch, tmp_path)
         session = FakeSession()
@@ -372,14 +391,21 @@ def test_channel_worker_new_message_reply_does_not_merge(monkeypatch, tmp_path):
             bot.Payload(update=FakeUpdate(m2, chat), ctx=ctx, text="second")
         )
 
-        # 后续 text_delta: 应该 reply 到 m2 (开新消息), 不再编辑 m1.replies[0]
+        # 后续 text_delta 仍属于第一 turn. 因 edit throttle 不保证立即刷出,
+        # 但绝不能落到尚未 begin_turn 的 msg2.
         session.queue.put_nowait(Event(kind="text_delta", chunk="answer-2"))
-        await wait_for(lambda: len(m2.replies) == 1)
-        assert m2.replies[0].text == "answer-2"
-        # m1 的旧 reply 停在最后流式状态, 没被 "answer-2" 污染
-        assert "answer-2" not in first_reply.text
-        # m1 的旧 reply 也没多新消息进来 (只在它 reply 链有第一条)
+        await asyncio.sleep(0.05)
+        assert len(m2.replies) == 0
         assert len(m1.replies) == 1
+
+        # 第一 turn 结束后, queued msg2 才 begin_turn; 新流式输出落到 msg2.
+        session.queue.put_nowait(
+            Event(kind="turn_end", response=Response(content="", session_id="sid-1", cost=0.01))
+        )
+        await wait_for(lambda: session.submitted == [("first", None), ("second", None)])
+        session.queue.put_nowait(Event(kind="text_delta", chunk="answer-msg2"))
+        await wait_for(lambda: len(m2.replies) == 1)
+        assert m2.replies[0].text == "answer-msg2"
 
         # 关掉 worker (turn_end 不发, 让 stop 自己 drain)
         await worker.stop()
@@ -388,9 +414,7 @@ def test_channel_worker_new_message_reply_does_not_merge(monkeypatch, tmp_path):
 
 
 def test_channel_worker_final_response_lands_on_active_reply_anchor(monkeypatch, tmp_path):
-    """P1-C/D: V 发 msg1 流式中 → 发 msg2 → SDK turn_end 来时, final response
-    应该落到 msg2 reply (V 视角 active anchor), 不是 msg1.
-    long-response overflow parts 也必须同 anchor, 不跨 msg1/msg2 分裂."""
+    """Cut-in 模式: msg1 final 留在 msg1 anchor; msg2 final 等自己的 turn_end."""
     async def run():
         reset_bot_globals(monkeypatch, tmp_path)
         session = FakeSession()
@@ -409,12 +433,12 @@ def test_channel_worker_final_response_lands_on_active_reply_anchor(monkeypatch,
         session.queue.put_nowait(Event(kind="text_delta", chunk="streaming-msg1"))
         await wait_for(lambda: len(m1.replies) == 1)
 
-        # V 中途发 msg2 — submit 切 active_reply_payload + 清 _text_message
+        # V 中途发 msg2 — 只 queue + interrupt, 不切当前 turn anchor.
         await worker.submit(
             bot.Payload(update=FakeUpdate(m2, chat), ctx=ctx, text="second")
         )
 
-        # SDK turn_end 来 — final response 应落 msg2 (active anchor), 不落 m1
+        # SDK turn_end 来 — final response 应落 msg1, 然后启动 msg2.
         session.queue.put_nowait(
             Event(
                 kind="turn_end",
@@ -423,13 +447,19 @@ def test_channel_worker_final_response_lands_on_active_reply_anchor(monkeypatch,
                 ),
             )
         )
-        # 等 m2 收到 final response (开新 reply, 因为 _text_message 被 submit 清了)
-        await wait_for(lambda: len(m2.replies) >= 1)
-        # m2 的 reply 包含 final content
-        assert any("final answer" in r.text for r in m2.replies)
-        # m1 的旧 reply 没被 final response 污染 — 停在最后流式状态
-        assert "final answer" not in m1.replies[0].text
-        assert "streaming-msg1" in m1.replies[0].text
+        await wait_for(lambda: "final answer" in m1.replies[0].text)
+        assert len(m2.replies) == 0
+        await wait_for(lambda: session.submitted == [("first", None), ("second", None)])
+
+        session.queue.put_nowait(
+            Event(
+                kind="turn_end",
+                response=Response(
+                    content="second final", session_id="sid-2", cost=0.05,
+                ),
+            )
+        )
+        await wait_for(lambda: any("second final" in r.text for r in m2.replies))
 
         await worker.stop()
 

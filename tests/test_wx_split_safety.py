@@ -106,8 +106,9 @@ def test_md_balanced_link_with_double_nested_paren():
 # ── strip_markdown fence info string ────────────────────────────────
 
 
-def test_strip_markdown_fence_with_dot_in_lang():
+def test_strip_markdown_fence_with_dot_in_lang(monkeypatch):
     # Round 2 codex finding: `.env` info string was leaking before fix.
+    monkeypatch.setenv("BABATA_WEIXIN_STRIP_MD", "1")
     text = "```.env\nKEY=value\n```"
     out = wb.strip_markdown(text)
     assert "KEY=value" in out
@@ -115,7 +116,8 @@ def test_strip_markdown_fence_with_dot_in_lang():
     assert "```" not in out
 
 
-def test_strip_markdown_fence_with_space_in_lang():
+def test_strip_markdown_fence_with_space_in_lang(monkeypatch):
+    monkeypatch.setenv("BABATA_WEIXIN_STRIP_MD", "1")
     text = "```shell script\nls -la\n```"
     out = wb.strip_markdown(text)
     assert "ls -la" in out
@@ -123,7 +125,8 @@ def test_strip_markdown_fence_with_space_in_lang():
     assert "```" not in out
 
 
-def test_strip_markdown_fence_with_csharp_lang():
+def test_strip_markdown_fence_with_csharp_lang(monkeypatch):
+    monkeypatch.setenv("BABATA_WEIXIN_STRIP_MD", "1")
     text = "```c#\nint x = 1;\n```"
     out = wb.strip_markdown(text)
     assert "int x = 1;" in out
@@ -264,9 +267,10 @@ def test_chunk_text_long_splits_at_newline():
 # ── strip_markdown: fenced code body must survive ───────────────────
 
 
-def test_strip_markdown_keeps_fenced_code_body():
+def test_strip_markdown_keeps_fenced_code_body(monkeypatch):
     """Codex review found ` ``` ... ``` ` was being deleted whole; user lost
-    code output entirely. After fix we keep the inner text, drop fence."""
+    code output entirely. Strip fallback keeps the inner text, drops fence."""
+    monkeypatch.setenv("BABATA_WEIXIN_STRIP_MD", "1")
     text = "before\n```python\nimport os\nprint('hi')\n```\nafter"
     out = wb.strip_markdown(text)
     assert "import os" in out
@@ -274,14 +278,16 @@ def test_strip_markdown_keeps_fenced_code_body():
     assert "```" not in out
 
 
-def test_strip_markdown_keeps_unlabelled_fence():
+def test_strip_markdown_keeps_unlabelled_fence(monkeypatch):
+    monkeypatch.setenv("BABATA_WEIXIN_STRIP_MD", "1")
     text = "```\nplain block content\n```"
     out = wb.strip_markdown(text)
     assert "plain block content" in out
     assert "```" not in out
 
 
-def test_strip_markdown_link_to_label_plus_url():
+def test_strip_markdown_link_to_label_plus_url(monkeypatch):
+    monkeypatch.setenv("BABATA_WEIXIN_STRIP_MD", "1")
     out = wb.strip_markdown("see [docs](https://example.com) end")
     assert "docs" in out
     assert "https://example.com" in out

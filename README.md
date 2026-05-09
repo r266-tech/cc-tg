@@ -50,7 +50,7 @@ babata doesn't touch your `~/.claude/` settings, doesn't read your OAuth keychai
 babata shares your existing logged-in CC — same skills, same settings, same OAuth. No `ANTHROPIC_API_KEY` needed. Quota / settings changes affect both.
 
 **Full trust** (`.env`: `BABATA_FULL_TRUST=1`):
-babata's CC subprocess runs with `cwd=$HOME` and `permission_mode=bypassPermissions` — can read your home, run any command without prompts. ⚠️ Only when `ALLOWED_USER_ID` is strictly correct, since anyone who can DM the bot effectively gets shell access.
+babata's CC subprocess runs with `cwd=$HOME` and `permission_mode=auto` (CC official auto mode, status shows "auto mode on") — can read your home, run any command without prompts for low-risk work. ⚠️ Only when `ALLOWED_USER_ID` is strictly correct, since anyone who can DM the bot effectively gets shell access.
 
 ## Multi-instance
 
