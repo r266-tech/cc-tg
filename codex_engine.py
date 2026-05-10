@@ -32,6 +32,27 @@ _CODEX_IMAGE_EXT = {
     "image/gif": ".gif",
     "image/webp": ".webp",
 }
+_CODEX_SPLIT_ERRORS = (
+    "Separator is not found, and chunk exceed the limit",
+    "Separator is found, but chunk is longer than limit",
+)
+_CODEX_STREAM_LIMIT = 64 * 1024 * 1024
+
+
+def _is_codex_split_error(message: str | None) -> bool:
+    if not message:
+        return False
+    return any(marker in message for marker in _CODEX_SPLIT_ERRORS)
+
+
+def _split_error_content(content: str) -> str:
+    if content:
+        return content
+    return (
+        "Codex CLI hit its long-output splitter limit before producing a final "
+        "answer. Please retry the request with a narrower scope, or start a "
+        "fresh session with /new."
+    )
 
 
 def _codex_cli_path() -> str:
@@ -258,6 +279,7 @@ class CodexEngine(CC):
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            limit=_CODEX_STREAM_LIMIT,
         )
         assert proc.stdout is not None
         assert proc.stderr is not None
@@ -267,6 +289,7 @@ class CodexEngine(CC):
         tools: list[str] = []
         usage: dict[str, int] = {}
         streamed = False
+        failure_message: str | None = None
 
         try:
             async for raw in proc.stdout:
@@ -281,6 +304,16 @@ class CodexEngine(CC):
                 etype = event.get("type")
                 if etype == "thread.started":
                     sid = event.get("thread_id") or sid
+                    continue
+                if etype == "turn.failed":
+                    err = event.get("error") or {}
+                    if isinstance(err, dict) and err.get("message"):
+                        failure_message = str(err.get("message"))
+                    else:
+                        failure_message = json.dumps(event, ensure_ascii=False)
+                    continue
+                if etype == "error":
+                    failure_message = str(event.get("message") or line)
                     continue
                 if etype == "item.started":
                     item = event.get("item") or {}
@@ -321,10 +354,36 @@ class CodexEngine(CC):
             with suppress(asyncio.CancelledError):
                 await stderr_task
             raise
+        except Exception as e:
+            with suppress(ProcessLookupError, Exception):
+                proc.terminate()
+            with suppress(asyncio.TimeoutError, Exception):
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            stderr_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await stderr_task
+            if _is_codex_split_error(str(e)):
+                log.warning("codex stdout split failure: %s", str(e)[:300])
+                return {
+                    "sid": sid,
+                    "content": _split_error_content(content),
+                    "tools": tools,
+                    "usage": usage,
+                }
+            raise
 
         stderr = (await stderr_task).decode("utf-8", errors="replace").strip()
-        if rc != 0:
-            raise RuntimeError(stderr or f"codex exited {rc}")
+        error_text = "\n".join(part for part in (failure_message, stderr) if part)
+        if rc != 0 or failure_message:
+            if _is_codex_split_error(error_text):
+                log.warning("codex output split failure: %s", error_text[:300])
+                return {
+                    "sid": sid,
+                    "content": _split_error_content(content),
+                    "tools": tools,
+                    "usage": usage,
+                }
+            raise RuntimeError(error_text or f"codex exited {rc}")
         return {"sid": sid, "content": content, "tools": tools, "usage": usage}
 
     def _record_codex_turn(self, sid: str, prompt: str, content: str) -> None:

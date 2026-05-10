@@ -27,14 +27,27 @@ class FakeStream:
         return self._body
 
 
+class RaisingStream(FakeStream):
+    def __init__(self, exc: Exception):
+        super().__init__([])
+        self._exc = exc
+
+    async def __anext__(self):
+        raise self._exc
+
+
 class FakeProcess:
     def __init__(self, lines: list[str], returncode: int = 0, stderr: bytes = b""):
         self.stdout = FakeStream(lines)
         self.stderr = FakeStream(body=stderr)
         self._returncode = returncode
+        self.terminated = False
 
     async def wait(self):
         return self._returncode
+
+    def terminate(self):
+        self.terminated = True
 
 
 def _json_line(payload: dict) -> str:
@@ -94,10 +107,97 @@ def test_codex_engine_query_parses_json_and_persists(monkeypatch, tmp_path):
         assert streamed == [("/bin/zsh", None), (None, "OK")]
         assert "mcp_servers.tg" in " ".join(captured["cmd"])
         assert captured["kwargs"]["stdin"] is codex_engine.asyncio.subprocess.DEVNULL
+        assert captured["kwargs"]["limit"] == codex_engine._CODEX_STREAM_LIMIT
         state = json.loads((tmp_path / "session.json").read_text())
         assert state["session_id"] == "sid-1"
         assert state["recent_sids"] == ["sid-1"]
         assert state["codex_sessions"]["sid-1"]["turns"][-2:] == [["user", "hello"], ["assistant", "OK"]]
+
+    asyncio.run(run())
+
+
+def test_codex_engine_handles_stdout_reader_splitter_failure(monkeypatch, tmp_path):
+    proc = FakeProcess([])
+    proc.stdout = RaisingStream(ValueError("Separator is not found, and chunk exceed the limit"))
+
+    async def fake_create(*_cmd, **_kwargs):
+        return proc
+
+    async def run():
+        monkeypatch.setattr(codex_engine.asyncio, "create_subprocess_exec", fake_create)
+        session = codex_engine.CodexEngine(
+            state_file=tmp_path / "session.json",
+            source_prompt="Source: test.",
+        )
+
+        resp = await session.query("hello")
+
+        assert "long-output splitter limit" in resp.content
+        assert proc.terminated is True
+
+    asyncio.run(run())
+
+
+def test_codex_engine_keeps_content_on_splitter_failure(monkeypatch, tmp_path):
+    lines = [
+        _json_line({"type": "thread.started", "thread_id": "sid-err"}),
+        _json_line({
+            "type": "item.completed",
+            "item": {
+                "id": "item_0",
+                "type": "agent_message",
+                "text": "usable answer",
+            },
+        }),
+    ]
+
+    async def fake_create(*_cmd, **_kwargs):
+        return FakeProcess(
+            lines,
+            returncode=1,
+            stderr=b"Separator is not found, and chunk exceed the limit",
+        )
+
+    async def run():
+        monkeypatch.setattr(codex_engine.asyncio, "create_subprocess_exec", fake_create)
+        session = codex_engine.CodexEngine(
+            state_file=tmp_path / "session.json",
+            source_prompt="Source: test.",
+        )
+        monkeypatch.setattr(session, "_fire_hook", lambda *_: None)
+
+        resp = await session.query("hello")
+
+        assert resp.content == "usable answer"
+        assert resp.session_id == "sid-err"
+
+    asyncio.run(run())
+
+
+def test_codex_engine_handles_splitter_turn_failed_event(monkeypatch, tmp_path):
+    lines = [
+        _json_line({"type": "thread.started", "thread_id": "sid-failed"}),
+        _json_line({
+            "type": "turn.failed",
+            "error": {"message": "Separator is found, but chunk is longer than limit"},
+        }),
+    ]
+
+    async def fake_create(*_cmd, **_kwargs):
+        return FakeProcess(lines, returncode=0)
+
+    async def run():
+        monkeypatch.setattr(codex_engine.asyncio, "create_subprocess_exec", fake_create)
+        session = codex_engine.CodexEngine(
+            state_file=tmp_path / "session.json",
+            source_prompt="Source: test.",
+        )
+        monkeypatch.setattr(session, "_fire_hook", lambda *_: None)
+
+        resp = await session.query("hello")
+
+        assert resp.session_id == "sid-failed"
+        assert "long-output splitter limit" in resp.content
 
     asyncio.run(run())
 

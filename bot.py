@@ -20,6 +20,7 @@ import urllib.request
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +62,7 @@ from engine import (
     persist_engine,
 )
 from media import image_to_base64, transcribe_voice, understand_video
+from tg_transcript import install_bot_transcript, record_update, transcript_source
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED_USER = int(os.environ.get("ALLOWED_USER_ID", "0"))
@@ -433,8 +435,24 @@ def _fmt_tool(name: str, inp: dict) -> str:
     else:
         display = name
         emoji = _TOOL_EMOJI.get(name, "\U0001f527")
-    # First non-empty string value — dict is insertion-ordered, SDK emits schema order.
-    preview = next((str(v) for v in inp.values() if isinstance(v, str) and v), "")
+
+    preview = ""
+    for key in ("command", "cmd", "query", "q", "path", "url", "text"):
+        value = inp.get(key)
+        if isinstance(value, str) and value:
+            preview = value
+            break
+    if not preview:
+        # Avoid surfacing transport/internal fields such as Codex item ids.
+        skip = {"id", "type", "status", "name"}
+        preview = next(
+            (
+                str(v)
+                for k, v in inp.items()
+                if k not in skip and isinstance(v, str) and v
+            ),
+            "",
+        )
     preview = preview.replace("\n", " ").strip()
     if not preview:
         return f"{emoji} {display}"
@@ -1874,6 +1892,131 @@ def _codex_version() -> str:
         return "—"
 
 
+def _codex_config() -> dict[str, Any]:
+    try:
+        import tomllib
+
+        return tomllib.loads((Path.home() / ".codex" / "config.toml").read_text())
+    except Exception:
+        return {}
+
+
+def _codex_session_file(sid: str | None) -> Path | None:
+    if not sid:
+        return None
+    root = Path.home() / ".codex" / "sessions"
+    try:
+        matches = list(root.glob(f"**/*{sid}.jsonl"))
+    except Exception:
+        return None
+    if not matches:
+        return None
+    return max(matches, key=lambda p: p.stat().st_mtime)
+
+
+def _codex_model_window(model: str | None) -> int | None:
+    if not model:
+        return None
+    try:
+        data = json.loads((Path.home() / ".codex" / "models_cache.json").read_text())
+        models = data.get("models") if isinstance(data, dict) else None
+        if not isinstance(models, list):
+            return None
+        for item in models:
+            if not isinstance(item, dict):
+                continue
+            if model in {item.get("slug"), item.get("id")}:
+                win = item.get("context_window") or item.get("max_context_window")
+                if not win:
+                    return None
+                pct = item.get("effective_context_window_percent") or 100
+                return int(float(win) * float(pct) / 100)
+    except Exception:
+        return None
+    return None
+
+
+def _codex_status_snapshot(sid: str | None) -> dict[str, Any]:
+    """Best-effort Codex status from the same local files the CLI writes.
+
+    `codex exec --json` does not expose a stable `/status` command, but session
+    JSONL records token-count events with context and rate-limit snapshots.
+    """
+    cfg = _codex_config()
+    model = os.environ.get("BABATA_CODEX_MODEL") or str(cfg.get("model") or "codex")
+    effort = str(cfg.get("model_reasoning_effort") or "—")
+    info: dict[str, Any] = {}
+    rate_limits: dict[str, Any] | None = None
+
+    fp = _codex_session_file(sid)
+    if fp:
+        try:
+            with fp.open() as f:
+                for line in f:
+                    if '"turn_context"' in line:
+                        try:
+                            d = json.loads(line)
+                        except Exception:
+                            continue
+                        payload = d.get("payload") if isinstance(d, dict) else {}
+                        if isinstance(payload, dict):
+                            model = str(payload.get("model") or model)
+                            effort = str(payload.get("effort") or effort)
+                            collab = payload.get("collaboration_mode") or {}
+                            settings = collab.get("settings") if isinstance(collab, dict) else {}
+                            if isinstance(settings, dict):
+                                model = str(settings.get("model") or model)
+                                effort = str(settings.get("reasoning_effort") or effort)
+                    elif '"token_count"' in line:
+                        try:
+                            d = json.loads(line)
+                        except Exception:
+                            continue
+                        payload = d.get("payload") if isinstance(d, dict) else {}
+                        if not isinstance(payload, dict) or payload.get("type") != "token_count":
+                            continue
+                        event_info = payload.get("info")
+                        if isinstance(event_info, dict):
+                            info = event_info
+                        event_rl = d.get("rate_limits") or payload.get("rate_limits")
+                        if isinstance(event_rl, dict):
+                            rate_limits = event_rl
+        except Exception:
+            pass
+
+    last = info.get("last_token_usage") if isinstance(info, dict) else {}
+    if not isinstance(last, dict):
+        last = {}
+    context_window = info.get("model_context_window") if isinstance(info, dict) else None
+    if not context_window:
+        context_window = _codex_model_window(model)
+
+    context_used = (
+        last.get("input_tokens")
+        or last.get("total_tokens")
+        or 0
+    )
+    return {
+        "model": model,
+        "effort": effort,
+        "context_window": int(context_window or 0),
+        "context_used": int(context_used or 0),
+        "last_usage": last,
+        "rate_limits": rate_limits,
+        "session_file": str(fp) if fp else "",
+    }
+
+
+def _fmt_codex_limit(rate_limits: dict[str, Any] | None, key: str, label: str) -> str | None:
+    entry = (rate_limits or {}).get(key)
+    if not isinstance(entry, dict):
+        return None
+    used = entry.get("used_percent")
+    if used is None:
+        return f"{label} —"
+    return f"{label} {float(used):.0f}% · resets {_fmt_reset(entry.get('resets_at'))}"
+
+
 # ── Status: quota / today cost / formatting helpers ──────────────────
 #
 # V's terminal CC /status shows:
@@ -2205,16 +2348,55 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if _current_cpu_name() == "codex":
-        actual = _last_model or os.environ.get("BABATA_CODEX_MODEL") or "codex"
+        snap = _codex_status_snapshot(cc._session_id)
+        snap_model = str(snap.get("model") or "")
+        state_model = _last_model if _last_model and _last_model != "codex" else ""
+        actual = (
+            snap_model
+            if snap_model and snap_model != "codex"
+            else state_model or snap_model or os.environ.get("BABATA_CODEX_MODEL") or "codex"
+        )
+        effort = snap.get("effort") or "—"
+        used = int(snap.get("context_used") or 0)
+        win = int(snap.get("context_window") or 0)
         fallback_used = _last_used_tokens if _last_session_id == cc._session_id else 0
-        used_line = f"{_fmt_tok(fallback_used)} last turn" if fallback_used else "tokens —"
+        if not used:
+            used = fallback_used
+        pct_ctx = (used / win * 100) if (win and used > 0) else 0.0
+        bar = _progress_bar(pct_ctx)
+        window_short = _short_window(win)
+        last_usage = snap.get("last_usage") if isinstance(snap.get("last_usage"), dict) else {}
+        out_tokens = int(last_usage.get("output_tokens") or 0)
+        reason_tokens = int(last_usage.get("reasoning_output_tokens") or 0)
+        token_bits = []
+        if used:
+            token_bits.append(f"{_fmt_tok(used)} in")
+        if out_tokens:
+            token_bits.append(f"{_fmt_tok(out_tokens)} out")
+        if reason_tokens:
+            token_bits.append(f"{_fmt_tok(reason_tokens)} reasoning")
+        token_line = " · ".join(token_bits) if token_bits else "tokens —"
+        limits = snap.get("rate_limits") if isinstance(snap.get("rate_limits"), dict) else None
+        five_hour_line = _fmt_codex_limit(limits, "primary", "5h")
+        week_line = _fmt_codex_limit(limits, "secondary", "week")
+        plan_type = (limits or {}).get("plan_type") if isinstance(limits, dict) else None
         sids = cc._load_state().get("recent_sids") or []
         sid_now = cc._session_id if cc._session_id else "(new)"
         labels = {0: "hidden", 1: "flash", 2: "keep"}
         lines = [
             "<b>📊 Status</b>",
             "",
-            f"{html.escape(_short_model(actual))} · {used_line}",
+            f"{bar} {pct_ctx:.0f}% · {html.escape(_short_model(actual))} {html.escape(str(effort))} ({window_short})",
+            "",
+            html.escape(token_line),
+        ]
+        if five_hour_line:
+            lines.append(html.escape(five_hour_line))
+        if week_line:
+            lines.append(html.escape(week_line))
+        if plan_type:
+            lines.append(html.escape(f"plan {plan_type}"))
+        lines += [
             "",
             f"Codex v{_codex_version()} · {labels.get(_verbose, _verbose)}",
             f"<code>{html.escape(actual)}</code>",
@@ -2678,6 +2860,9 @@ async def on_provider_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     if not await _callback_allowed(q):
         return
     await q.answer()
+    if _current_cpu_name() != "claude":
+        await q.edit_message_text("当前 CPU 是 Codex，/provider 不生效；先 /cpu claude 再切 Anthropic 渠道。")
+        return
     data = q.data or ""
     if ":" not in data:
         return
@@ -2918,6 +3103,13 @@ _RESUME_CATEGORIES: list[tuple[str, str, list[str], bool]] = [
 ]
 
 
+def _resume_categories_for_current_cpu() -> list[tuple[str, str, list[str], bool]]:
+    if _current_cpu_name() != "codex":
+        return _RESUME_CATEGORIES
+    cat_id, _name, labels, scan_all = _RESUME_CATEGORIES[0]
+    return [(cat_id, "当前 Codex", labels, scan_all)]
+
+
 def _render_resume_channel_picker() -> tuple[str, "InlineKeyboardMarkup"]:
     """Build the Level-1 渠道 picker (header text + keyboard).
 
@@ -2926,9 +3118,10 @@ def _render_resume_channel_picker() -> tuple[str, "InlineKeyboardMarkup"]:
     """
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+    categories = _resume_categories_for_current_cpu()
     buttons = [
         [InlineKeyboardButton(name, callback_data=f"resume-ch:{cat}")]
-        for cat, name, _, _ in _RESUME_CATEGORIES
+        for cat, name, _, _ in categories
     ]
     cur = cc._session_id
     header = f"当前: {cur[:8]}\n选一个渠道:" if cur else "当前: (无)\n选一个渠道:"
@@ -2978,10 +3171,10 @@ async def on_resume_channel_pick(
         return
     cat_id = data.split(":", 1)[1]
 
-    cat = next((c for c in _RESUME_CATEGORIES if c[0] == cat_id), None)
+    cat = next((c for c in _resume_categories_for_current_cpu() if c[0] == cat_id), None)
     if not cat:
         try:
-            await query.edit_message_text(f"❌ 未知渠道: {cat_id}")
+            await query.edit_message_text(f"❌ 当前 CPU 不支持该 resume 渠道: {cat_id}")
         except Exception:
             pass
         return
@@ -3185,10 +3378,21 @@ async def _process(
         await msg.reply_text(f"Error: {e}")
 
 
+def _with_transcript(source: str, handler):
+    @wraps(handler)
+    async def wrapped(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        record_update(update, source)
+        with transcript_source(source):
+            await handler(update, ctx)
+
+    return wrapped
+
+
 # ── Main ──────────────────────────────────────────────────────────────
 
 async def _post_init(app: Application) -> None:
     global _channel_worker
+    install_bot_transcript(app.bot)
     await bridge.start()
     asyncio.create_task(_heartbeat_loop(app))
     # Default context so terminal CC (no TG message yet) can push to user's TG
@@ -3251,29 +3455,29 @@ def main() -> None:
     _spawn_weixin_if_configured()
     app = Application.builder().token(TOKEN).concurrent_updates(True).post_init(_post_init).build()
 
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("context", cmd_context))
-    app.add_handler(CommandHandler("verbose", cmd_verbose))
-    app.add_handler(CommandHandler("cpu", cmd_cpu))
-    app.add_handler(CommandHandler("resume", cmd_resume))
-    app.add_handler(CommandHandler("stop", cmd_stop))
-    app.add_handler(CommandHandler("restart", cmd_restart))
-    app.add_handler(CommandHandler("provider", cmd_provider))
-    app.add_handler(CommandHandler("new", on_text))
-    app.add_handler(CallbackQueryHandler(on_verbose_click, pattern=r"^verbose:"))
-    app.add_handler(CallbackQueryHandler(on_cpu_click, pattern=r"^cpu:"))
-    app.add_handler(CallbackQueryHandler(on_provider_click, pattern=r"^provider:"))
+    app.add_handler(CommandHandler("status", _with_transcript("cmd_status", cmd_status)))
+    app.add_handler(CommandHandler("context", _with_transcript("cmd_context", cmd_context)))
+    app.add_handler(CommandHandler("verbose", _with_transcript("cmd_verbose", cmd_verbose)))
+    app.add_handler(CommandHandler("cpu", _with_transcript("cmd_cpu", cmd_cpu)))
+    app.add_handler(CommandHandler("resume", _with_transcript("cmd_resume", cmd_resume)))
+    app.add_handler(CommandHandler("stop", _with_transcript("cmd_stop", cmd_stop)))
+    app.add_handler(CommandHandler("restart", _with_transcript("cmd_restart", cmd_restart)))
+    app.add_handler(CommandHandler("provider", _with_transcript("cmd_provider", cmd_provider)))
+    app.add_handler(CommandHandler("new", _with_transcript("cmd_new", on_text)))
+    app.add_handler(CallbackQueryHandler(_with_transcript("cb_verbose", on_verbose_click), pattern=r"^verbose:"))
+    app.add_handler(CallbackQueryHandler(_with_transcript("cb_cpu", on_cpu_click), pattern=r"^cpu:"))
+    app.add_handler(CallbackQueryHandler(_with_transcript("cb_provider", on_provider_click), pattern=r"^provider:"))
     # resume-ch: / resume-back / resume: 三个 pattern 互斥 (第 7 字符不同),
     # 注册顺序无关紧要; 仍按 specific → generic 排列利于阅读.
-    app.add_handler(CallbackQueryHandler(on_resume_channel_pick, pattern=r"^resume-ch:"))
-    app.add_handler(CallbackQueryHandler(on_resume_back, pattern=r"^resume-back$"))
-    app.add_handler(CallbackQueryHandler(on_resume_click, pattern=r"^resume:"))
-    app.add_handler(CallbackQueryHandler(on_button_click, pattern=r"^mcp:"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
-    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
-    app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE, on_video))
-    app.add_handler(MessageHandler(filters.Document.ALL, on_document))
+    app.add_handler(CallbackQueryHandler(_with_transcript("cb_resume_channel", on_resume_channel_pick), pattern=r"^resume-ch:"))
+    app.add_handler(CallbackQueryHandler(_with_transcript("cb_resume_back", on_resume_back), pattern=r"^resume-back$"))
+    app.add_handler(CallbackQueryHandler(_with_transcript("cb_resume", on_resume_click), pattern=r"^resume:"))
+    app.add_handler(CallbackQueryHandler(_with_transcript("cb_mcp", on_button_click), pattern=r"^mcp:"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _with_transcript("text", on_text)))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, _with_transcript("voice", on_voice)))
+    app.add_handler(MessageHandler(filters.PHOTO, _with_transcript("photo", on_photo)))
+    app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE, _with_transcript("video", on_video)))
+    app.add_handler(MessageHandler(filters.Document.ALL, _with_transcript("document", on_document)))
 
     log.info("Bot starting (user: %s)", ALLOWED_USER)
     # stop_signals=None: 禁用 PTB 默认 SIGTERM/SIGINT 立即停止逻辑; 我们在

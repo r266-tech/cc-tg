@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 
 from constants import BRIDGE_SOCKET, PROJECT
+from tg_transcript import transcript_source
 
 log = logging.getLogger(__name__)
 
@@ -153,7 +154,8 @@ class TGBridge:
                 await self._respond(writer, f"Unknown action: {action}")
                 return
 
-            await handler(request, writer)
+            with transcript_source(f"bridge:{action}"):
+                await handler(request, writer)
 
         except Exception as e:
             log.warning("Bridge error: %s", e)

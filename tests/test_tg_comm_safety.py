@@ -44,6 +44,19 @@ def test_long_link_falls_back_to_plain_chunks():
     assert all(bot._utf16_len(part) <= bot._MAX_TG for part in parts)
 
 
+def test_fmt_tool_skips_codex_internal_item_id():
+    line = bot._fmt_tool(
+        "/bin/zsh",
+        {
+            "id": "item_1",
+            "type": "command_execution",
+            "command": "/bin/zsh -lc 'echo ok'",
+        },
+    )
+
+    assert line == "🔧 /bin/zsh: \"/bin/zsh -lc 'echo ok'\""
+
+
 class FakeUser:
     def __init__(self, user_id: int):
         self.id = user_id

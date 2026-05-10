@@ -85,6 +85,25 @@ class FakeUpdate:
         self.effective_user = FakeUser(user_id) if user_id is not None else None
 
 
+class FakeCallbackQuery:
+    def __init__(self, user_id: int, data: str):
+        self.from_user = FakeUser(user_id)
+        self.data = data
+        self.answers = []
+        self.edits = []
+
+    async def answer(self, text=None, **kwargs):
+        self.answers.append((text, kwargs))
+
+    async def edit_message_text(self, text, **kwargs):
+        self.edits.append((text, kwargs))
+
+
+class FakeCallbackUpdate:
+    def __init__(self, query: FakeCallbackQuery):
+        self.callback_query = query
+
+
 class FakeBot:
     """PTB Bot stub. Records set_message_reaction calls so tests can assert
     👀 fired at turn-begin and 👌 at turn-end."""
@@ -171,6 +190,14 @@ class FakeCpuSession:
         self._babata_engine_name = name
         self._state_file = state_file
         self._session_id = sid
+
+    def _load_state(self):
+        if self._state_file is None:
+            return {}
+        try:
+            return json.loads(self._state_file.read_text())
+        except Exception:
+            return {}
 
     def _record_sid(self, sid: str | None):
         if self._state_file is None:
@@ -272,6 +299,97 @@ def test_codex_rejects_hidden_commands_when_typed(monkeypatch, tmp_path):
         provider_msg = FakeMessage(12, "/provider")
         await bot.cmd_provider(FakeUpdate(provider_msg, chat, user_id=7), ctx)
         assert "不生效" in provider_msg.replies[-1].text
+
+    asyncio.run(run())
+
+
+def test_codex_rejects_provider_callback(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        monkeypatch.setattr(bot, "ALLOWED_USER", 7)
+        monkeypatch.setattr(bot, "cc", FakeCpuSession("codex"))
+
+        async def fail_switch(*args, **kwargs):
+            raise AssertionError("provider switch should not run in Codex mode")
+
+        monkeypatch.setattr(bot, "_run_cc_router_switch", fail_switch)
+        query = FakeCallbackQuery(user_id=7, data="provider:openrouter")
+
+        await bot.on_provider_click(FakeCallbackUpdate(query), FakeCtx())
+
+        assert query.answers == [(None, {})]
+        assert "不生效" in query.edits[-1][0]
+
+    asyncio.run(run())
+
+
+def test_codex_resume_picker_only_shows_current_channel(monkeypatch, tmp_path):
+    reset_bot_globals(monkeypatch, tmp_path)
+    monkeypatch.setattr(bot, "cc", FakeCpuSession("codex", sid="sid-12345678"))
+
+    _header, markup = bot._render_resume_channel_picker()
+
+    buttons = markup[0][0]
+    assert len(buttons) == 1
+    button = buttons[0][0]
+    assert button[0][0] == "当前 Codex"
+    assert button[1]["callback_data"] == "resume-ch:tg"
+
+
+def test_codex_status_reads_session_usage(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        monkeypatch.setattr(bot, "ALLOWED_USER", 7)
+        state_file = tmp_path / "state.json"
+        state_file.write_text(json.dumps({"recent_sids": ["sid-1"]}))
+        monkeypatch.setattr(bot, "cc", FakeCpuSession("codex", state_file, "sid-1"))
+        monkeypatch.setattr(bot, "_last_model", "codex")
+        monkeypatch.setattr(bot, "_codex_version", lambda: "0.128.0")
+        session_file = tmp_path / "rollout-sid-1.jsonl"
+        session_file.write_text("\n".join([
+            json.dumps({
+                "type": "turn_context",
+                "payload": {
+                    "model": "gpt-5.5",
+                    "effort": "xhigh",
+                },
+            }),
+            json.dumps({
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {
+                            "input_tokens": 1000,
+                            "output_tokens": 200,
+                            "reasoning_output_tokens": 50,
+                        },
+                        "model_context_window": 2000,
+                    },
+                },
+                "rate_limits": {
+                    "primary": {"used_percent": 12, "resets_at": 1_778_418_860},
+                    "secondary": {"used_percent": 34, "resets_at": 1_778_911_266},
+                    "plan_type": "prolite",
+                },
+            }),
+        ]))
+        monkeypatch.setattr(bot, "_codex_session_file", lambda sid: session_file)
+        monkeypatch.setattr(bot, "_codex_config", lambda: {"model": "fallback", "model_reasoning_effort": "medium"})
+
+        msg = FakeMessage(13, "/status")
+        await bot.cmd_status(FakeUpdate(msg, FakeChat(), user_id=7), FakeCtx())
+
+        text = msg.replies[-1].text
+        assert "50%" in text
+        assert "gpt-5.5 xhigh" in text
+        assert "1.0K in" in text
+        assert "200 out" in text
+        assert "50 reasoning" in text
+        assert "5h 12%" in text
+        assert "week 34%" in text
+        assert "plan prolite" in text
+        assert "Codex v0.128.0" in text
 
     asyncio.run(run())
 
