@@ -375,7 +375,8 @@ def test_codex_status_reads_session_usage(monkeypatch, tmp_path):
             }),
         ]))
         monkeypatch.setattr(bot, "_codex_session_file", lambda sid: session_file)
-        monkeypatch.setattr(bot, "_codex_config", lambda: {"model": "fallback", "model_reasoning_effort": "medium"})
+        monkeypatch.setattr(bot, "_codex_sessions_root", lambda: tmp_path)
+        monkeypatch.setattr(bot, "_codex_config", lambda: {"model": "gpt-5.5", "model_reasoning_effort": "xhigh"})
 
         msg = FakeMessage(13, "/status")
         await bot.cmd_status(FakeUpdate(msg, FakeChat(), user_id=7), FakeCtx())
@@ -386,10 +387,11 @@ def test_codex_status_reads_session_usage(monkeypatch, tmp_path):
         assert "1.0K in" in text
         assert "200 out" in text
         assert "50 reasoning" in text
-        assert "5h 12%" in text
-        assert "week 34%" in text
+        assert "5h limit 88% left" in text
+        assert "weekly limit 66% left" in text
         assert "plan prolite" in text
         assert "Codex v0.128.0" in text
+        assert "current <code>gpt-5.5</code> · effort <code>xhigh</code>" in text
 
     asyncio.run(run())
 

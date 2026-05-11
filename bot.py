@@ -1877,12 +1877,16 @@ def _sdk_version() -> str:
         return "—"
 
 
-def _codex_version() -> str:
-    cli = (
+def _codex_cli_path() -> str | None:
+    return (
         os.environ.get("BABATA_CODEX_CLI_PATH")
         or os.environ.get("CODEX_CLI_PATH")
         or shutil.which("codex")
     )
+
+
+def _codex_version() -> str:
+    cli = _codex_cli_path()
     if not cli:
         return "—"
     try:
@@ -1904,7 +1908,7 @@ def _codex_config() -> dict[str, Any]:
 def _codex_session_file(sid: str | None) -> Path | None:
     if not sid:
         return None
-    root = Path.home() / ".codex" / "sessions"
+    root = _codex_sessions_root()
     try:
         matches = list(root.glob(f"**/*{sid}.jsonl"))
     except Exception:
@@ -1912,6 +1916,10 @@ def _codex_session_file(sid: str | None) -> Path | None:
     if not matches:
         return None
     return max(matches, key=lambda p: p.stat().st_mtime)
+
+
+def _codex_sessions_root() -> Path:
+    return Path.home() / ".codex" / "sessions"
 
 
 def _codex_model_window(model: str | None) -> int | None:
@@ -1936,15 +1944,26 @@ def _codex_model_window(model: str | None) -> int | None:
     return None
 
 
+def _codex_event_rate_limits(event: dict[str, Any]) -> dict[str, Any] | None:
+    payload = event.get("payload") if isinstance(event, dict) else {}
+    if not isinstance(payload, dict) or payload.get("type") != "token_count":
+        return None
+    rate_limits = event.get("rate_limits") or payload.get("rate_limits")
+    return rate_limits if isinstance(rate_limits, dict) else None
+
+
 def _codex_status_snapshot(sid: str | None) -> dict[str, Any]:
     """Best-effort Codex status from the same local files the CLI writes.
 
-    `codex exec --json` does not expose a stable `/status` command, but session
-    JSONL records token-count events with context and rate-limit snapshots.
+    `codex exec --json` does not expose a stable `/status` command. Session
+    JSONL gives us the same per-session snapshot that terminal `/status` shows;
+    the Codex App settings panel is a separate account-level view and can differ.
     """
     cfg = _codex_config()
-    model = os.environ.get("BABATA_CODEX_MODEL") or str(cfg.get("model") or "codex")
-    effort = str(cfg.get("model_reasoning_effort") or "—")
+    configured_model = os.environ.get("BABATA_CODEX_MODEL") or str(cfg.get("model") or "codex")
+    configured_effort = str(cfg.get("model_reasoning_effort") or "—")
+    model = configured_model
+    effort = configured_effort
     info: dict[str, Any] = {}
     rate_limits: dict[str, Any] | None = None
 
@@ -1978,7 +1997,7 @@ def _codex_status_snapshot(sid: str | None) -> dict[str, Any]:
                         event_info = payload.get("info")
                         if isinstance(event_info, dict):
                             info = event_info
-                        event_rl = d.get("rate_limits") or payload.get("rate_limits")
+                        event_rl = _codex_event_rate_limits(d)
                         if isinstance(event_rl, dict):
                             rate_limits = event_rl
         except Exception:
@@ -1999,6 +2018,8 @@ def _codex_status_snapshot(sid: str | None) -> dict[str, Any]:
     return {
         "model": model,
         "effort": effort,
+        "configured_model": configured_model,
+        "configured_effort": configured_effort,
         "context_window": int(context_window or 0),
         "context_used": int(context_used or 0),
         "last_usage": last,
@@ -2007,14 +2028,46 @@ def _codex_status_snapshot(sid: str | None) -> dict[str, Any]:
     }
 
 
-def _fmt_codex_limit(rate_limits: dict[str, Any] | None, key: str, label: str) -> str | None:
-    entry = (rate_limits or {}).get(key)
+def _codex_limit_entry(
+    rate_limits: dict[str, Any] | None,
+    key: str,
+    window_minutes: int,
+) -> dict[str, Any] | None:
+    if not isinstance(rate_limits, dict):
+        return None
+    for value in rate_limits.values():
+        if not isinstance(value, dict):
+            continue
+        try:
+            minutes = int(value.get("window_minutes") or 0)
+        except Exception:
+            continue
+        if minutes == window_minutes:
+            return value
+    entry = rate_limits.get(key)
+    if not isinstance(entry, dict):
+        return None
+    return entry
+
+
+def _fmt_codex_limit(
+    rate_limits: dict[str, Any] | None,
+    key: str,
+    label: str,
+    window_minutes: int,
+) -> str | None:
+    entry = _codex_limit_entry(rate_limits, key, window_minutes)
     if not isinstance(entry, dict):
         return None
     used = entry.get("used_percent")
     if used is None:
         return f"{label} —"
-    return f"{label} {float(used):.0f}% · resets {_fmt_reset(entry.get('resets_at'))}"
+    try:
+        left = 100.0 - float(used)
+    except Exception:
+        return f"{label} —"
+    left = max(0.0, min(100.0, left))
+    return f"{label} {left:.0f}% left · resets {_fmt_codex_reset(entry.get('resets_at'))}"
 
 
 # ── Status: quota / today cost / formatting helpers ──────────────────
@@ -2198,6 +2251,23 @@ def _fmt_reset(value: Any) -> str:
     return dt.strftime("%b %-d")
 
 
+def _fmt_codex_reset(value: Any) -> str:
+    """Codex TUI-style reset display: '13:11' today, '14:01 on 16 May' later."""
+    if value is None or value == "":
+        return "—"
+    try:
+        if isinstance(value, (int, float)):
+            dt = datetime.fromtimestamp(float(value)).astimezone()
+        else:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone()
+    except Exception:
+        return "—"
+    now = datetime.now().astimezone()
+    if dt.date() == now.date():
+        return dt.strftime("%H:%M")
+    return dt.strftime("%H:%M on %-d %b")
+
+
 def _progress_bar(pct: float, width: int = 15) -> str:
     """Render a block progress bar. Uses █ (full) vs ░ (light) — solid contrast
     renders cleanly in TG's iOS system font; ▓ (medium shade) gets rendered as
@@ -2377,9 +2447,11 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             token_bits.append(f"{_fmt_tok(reason_tokens)} reasoning")
         token_line = " · ".join(token_bits) if token_bits else "tokens —"
         limits = snap.get("rate_limits") if isinstance(snap.get("rate_limits"), dict) else None
-        five_hour_line = _fmt_codex_limit(limits, "primary", "5h")
-        week_line = _fmt_codex_limit(limits, "secondary", "week")
+        five_hour_line = _fmt_codex_limit(limits, "primary", "5h limit", 300)
+        week_line = _fmt_codex_limit(limits, "secondary", "weekly limit", 10_080)
         plan_type = (limits or {}).get("plan_type") if isinstance(limits, dict) else None
+        current_model = str(snap.get("configured_model") or actual)
+        current_effort = str(snap.get("configured_effort") or effort or "—")
         sids = cc._load_state().get("recent_sids") or []
         sid_now = cc._session_id if cc._session_id else "(new)"
         labels = {0: "hidden", 1: "flash", 2: "keep"}
@@ -2399,7 +2471,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         lines += [
             "",
             f"Codex v{_codex_version()} · {labels.get(_verbose, _verbose)}",
-            f"<code>{html.escape(actual)}</code>",
+            f"current <code>{html.escape(current_model)}</code> · effort <code>{html.escape(current_effort)}</code>",
             f"<code>{sid_now}</code> · {len(sids)} recent",
         ]
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
