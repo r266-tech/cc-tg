@@ -51,6 +51,8 @@ _SIDEBAR_HOST = os.environ.get("BABATA_SIDEBAR_HOST", "127.0.0.1")
 _SIDEBAR_PORT = int(os.environ.get("BABATA_SIDEBAR_PORT", "18791"))
 _SIDEBAR_MCP_SCRIPT = str(Path(__file__).parent / "sidebar_mcp.py")
 _CC_IMAGE_MIME_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+_TOOL_INPUT_MAX_CHARS = 6000
+_TOOL_RESULT_MAX_CHARS = 4000
 _ALLOWED_ORIGINS = {
     o.strip()
     for o in os.environ.get("BABATA_SIDEBAR_ALLOWED_ORIGINS", "").split(",")
@@ -168,6 +170,36 @@ _proactive_lock = asyncio.Lock()
 async def _sse_write(resp: web.StreamResponse, payload: dict[str, Any]) -> None:
     line = "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
     await resp.write(line.encode("utf-8"))
+
+
+def _json_safe(value: Any) -> Any:
+    try:
+        encoded = json.dumps(value, ensure_ascii=False, default=str)
+        return json.loads(encoded)
+    except Exception:
+        return str(value)
+
+
+def _preview_jsonish(value: Any, max_chars: int) -> Any:
+    safe = _json_safe(value)
+    try:
+        rendered = json.dumps(safe, ensure_ascii=False)
+    except Exception:
+        rendered = str(safe)
+    if len(rendered) <= max_chars:
+        return safe
+    return {
+        "_truncated": True,
+        "chars": len(rendered),
+        "preview": rendered[:max_chars],
+    }
+
+
+def _preview_text(value: Any, max_chars: int) -> str:
+    text = str(value or "")
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars]}\n... [truncated {len(text) - max_chars} chars]"
 
 
 def _origin_allowed(origin: str) -> bool:
@@ -575,6 +607,7 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
     await resp.prepare(request)
 
     assistant_text_parts: list[str] = []
+    tool_trace: list[dict[str, Any]] = []
 
     async def on_stream(
         tool_name: str | None,
@@ -586,16 +619,47 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
             assistant_text_parts.append(text_chunk)
             await _sse_write(resp, {"type": "text_delta", "text": text_chunk})
         elif tool_name:
+            entry = {
+                "id": f"tool-{len(tool_trace) + 1}",
+                "name": tool_name,
+                "input": _preview_jsonish(tool_input or {}, _TOOL_INPUT_MAX_CHARS),
+                "status": "running",
+                "started_at": time.time(),
+            }
+            tool_trace.append(entry)
             await _sse_write(resp, {
                 "type": "tool_use",
+                "trace_id": entry["id"],
                 "name": tool_name,
-                "input": tool_input or {},
+                "input": entry["input"],
             })
         elif tool_result is not None:
+            text = _preview_text(tool_result.get("text"), _TOOL_RESULT_MAX_CHARS)
+            is_error = bool(tool_result.get("is_error"))
+            entry = next(
+                (item for item in reversed(tool_trace) if item.get("status") == "running"),
+                None,
+            )
+            if entry is None:
+                entry = {
+                    "id": f"tool-{len(tool_trace) + 1}",
+                    "name": "tool_result",
+                    "input": {},
+                    "started_at": time.time(),
+                }
+                tool_trace.append(entry)
+            ended_at = time.time()
+            entry["status"] = "error" if is_error else "done"
+            entry["is_error"] = is_error
+            entry["result"] = text
+            entry["ended_at"] = ended_at
+            if isinstance(entry.get("started_at"), (int, float)):
+                entry["duration_ms"] = int((ended_at - float(entry["started_at"])) * 1000)
             await _sse_write(resp, {
                 "type": "tool_result",
-                "is_error": bool(tool_result.get("is_error")),
-                "text": (tool_result.get("text") or "")[:4000],
+                "trace_id": entry["id"],
+                "is_error": is_error,
+                "text": text,
             })
 
     done_ok = False
@@ -606,6 +670,21 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
                 images=images or None,
                 on_stream=on_stream,
             )
+        for entry in tool_trace:
+            if entry.get("status") != "running":
+                continue
+            ended_at = time.time()
+            entry["status"] = "done"
+            entry["is_error"] = False
+            entry["ended_at"] = ended_at
+            if isinstance(entry.get("started_at"), (int, float)):
+                entry["duration_ms"] = int((ended_at - float(entry["started_at"])) * 1000)
+            await _sse_write(resp, {
+                "type": "tool_result",
+                "trace_id": entry["id"],
+                "is_error": False,
+                "text": "",
+            })
         await _sse_write(resp, {"type": "session", "session_id": response.session_id or ""})
         await _sse_write(resp, {"type": "done"})
         done_ok = True
@@ -623,8 +702,13 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
         # 把截断答案当完整答案展示 (V 看到的错误流已由 SSE error event 反馈).
         if message.strip() != "/new" and done_ok:
             assistant_text = "".join(assistant_text_parts).strip()
-            if assistant_text:
-                sidebar_history.append("assistant", assistant_text, url=chat_url)
+            if assistant_text or tool_trace:
+                sidebar_history.append(
+                    "assistant",
+                    assistant_text,
+                    url=chat_url,
+                    tool_trace=tool_trace,
+                )
         # video tmp files cleanup. file 类不删 (CC 可能后续 turn 用).
         for p in cleanup_paths:
             try:
