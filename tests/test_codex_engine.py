@@ -116,6 +116,60 @@ def test_codex_engine_query_parses_json_and_persists(monkeypatch, tmp_path):
     asyncio.run(run())
 
 
+def test_codex_engine_streams_tool_results(monkeypatch, tmp_path):
+    lines = [
+        _json_line({"type": "thread.started", "thread_id": "sid-tools"}),
+        _json_line({
+            "type": "item.started",
+            "item": {
+                "id": "call_0",
+                "type": "function_call",
+                "name": "browser_tab_list",
+                "arguments": {"active": True},
+            },
+        }),
+        _json_line({
+            "type": "item.completed",
+            "item": {
+                "id": "output_0",
+                "call_id": "call_0",
+                "type": "function_call_output",
+                "output": [{"title": "X 每日精华 | 2026-05-10"}],
+            },
+        }),
+        _json_line({
+            "type": "item.completed",
+            "item": {"id": "item_1", "type": "agent_message", "text": "OK"},
+        }),
+    ]
+
+    async def fake_create(*_cmd, **_kwargs):
+        return FakeProcess(lines)
+
+    async def run():
+        monkeypatch.setattr(codex_engine.asyncio, "create_subprocess_exec", fake_create)
+        session = codex_engine.CodexEngine(
+            state_file=tmp_path / "session.json",
+            source_prompt="Source: test.",
+        )
+        monkeypatch.setattr(session, "_fire_hook", lambda *_: None)
+        streamed = []
+
+        resp = await session.query(
+            "list tabs",
+            on_stream=lambda tool, inp, text, result: streamed.append((tool, text, result)) or asyncio.sleep(0),
+        )
+
+        assert resp.content == "OK"
+        assert resp.tools == ["browser_tab_list"]
+        assert streamed[0][0] == "browser_tab_list"
+        assert streamed[1][2]["is_error"] is False
+        assert "X 每日精华 | 2026-05-10" in streamed[1][2]["text"]
+        assert streamed[2] == (None, "OK", None)
+
+    asyncio.run(run())
+
+
 def test_codex_engine_handles_stdout_reader_splitter_failure(monkeypatch, tmp_path):
     proc = FakeProcess([])
     proc.stdout = RaisingStream(ValueError("Separator is not found, and chunk exceed the limit"))

@@ -377,6 +377,7 @@ def test_codex_status_reads_session_usage(monkeypatch, tmp_path):
         monkeypatch.setattr(bot, "_codex_session_file", lambda sid: session_file)
         monkeypatch.setattr(bot, "_codex_sessions_root", lambda: tmp_path)
         monkeypatch.setattr(bot, "_codex_config", lambda: {"model": "gpt-5.5", "model_reasoning_effort": "xhigh"})
+        monkeypatch.setattr(bot, "_fetch_codex_app_rate_limits", lambda: asyncio.sleep(0, result=None))
 
         msg = FakeMessage(13, "/status")
         await bot.cmd_status(FakeUpdate(msg, FakeChat(), user_id=7), FakeCtx())
@@ -391,9 +392,108 @@ def test_codex_status_reads_session_usage(monkeypatch, tmp_path):
         assert "weekly limit 66% left" in text
         assert "plan prolite" in text
         assert "Codex v0.128.0" in text
-        assert "current <code>gpt-5.5</code> · effort <code>xhigh</code>" in text
+        assert "current <code>gpt-5.5</code> · effort <code>xhigh</code>" not in text
 
     asyncio.run(run())
+
+
+def test_codex_status_prefers_live_app_server_limits(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        monkeypatch.setattr(bot, "ALLOWED_USER", 7)
+        state_file = tmp_path / "state.json"
+        state_file.write_text(json.dumps({"recent_sids": ["sid-1"]}))
+        monkeypatch.setattr(bot, "cc", FakeCpuSession("codex", state_file, "sid-1"))
+        monkeypatch.setattr(bot, "_last_model", "codex")
+        monkeypatch.setattr(bot, "_codex_version", lambda: "0.128.0")
+        session_file = tmp_path / "rollout-sid-1.jsonl"
+        session_file.write_text("\n".join([
+            json.dumps({
+                "type": "turn_context",
+                "payload": {"model": "gpt-5.5", "effort": "xhigh"},
+            }),
+            json.dumps({
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {"input_tokens": 1000},
+                        "model_context_window": 2000,
+                    },
+                },
+                "rate_limits": {
+                    "primary": {"used_percent": 12, "resets_at": 1_778_418_860},
+                    "secondary": {"used_percent": 34, "resets_at": 1_778_911_266},
+                    "plan_type": "stale",
+                },
+            }),
+        ]))
+        monkeypatch.setattr(bot, "_codex_session_file", lambda sid: session_file)
+        monkeypatch.setattr(bot, "_codex_config", lambda: {"model": "gpt-5.5", "model_reasoning_effort": "xhigh"})
+        monkeypatch.setattr(bot, "_fetch_codex_app_rate_limits", lambda: asyncio.sleep(0, result={
+            "primary": {"used_percent": 29, "window_minutes": 300, "resets_at": 1_778_494_266},
+            "secondary": {"used_percent": 33, "window_minutes": 10_080, "resets_at": 1_778_911_266},
+            "plan_type": "prolite",
+        }))
+
+        msg = FakeMessage(13, "/status")
+        await bot.cmd_status(FakeUpdate(msg, FakeChat(), user_id=7), FakeCtx())
+
+        text = msg.replies[-1].text
+        assert "5h limit 71% left" in text
+        assert "weekly limit 67% left" in text
+        assert "plan prolite" in text
+        assert "5h limit 88% left" not in text
+        assert "plan stale" not in text
+
+    asyncio.run(run())
+
+
+def test_codex_rate_limits_normalizes_app_server_shape():
+    result = {
+        "rateLimits": {
+            "limitId": "codex",
+            "primary": {"usedPercent": 40, "windowDurationMins": 300, "resetsAt": 111},
+            "secondary": {"usedPercent": 50, "windowDurationMins": 10_080, "resetsAt": 222},
+            "planType": "prolite",
+        },
+        "rateLimitsByLimitId": {
+            "codex": {
+                "limitId": "codex",
+                "limitName": None,
+                "primary": {"usedPercent": 29, "windowDurationMins": 300, "resetsAt": 333},
+                "secondary": {"usedPercent": 33, "windowDurationMins": 10_080, "resetsAt": 444},
+                "credits": {"hasCredits": False, "unlimited": False, "balance": "0"},
+                "planType": "prolite",
+                "rateLimitReachedType": None,
+            },
+        },
+    }
+
+    normalized = bot._normalize_codex_rate_limits_response(result)
+
+    assert normalized == {
+        "limit_id": "codex",
+        "limit_name": None,
+        "primary": {"used_percent": 29, "window_minutes": 300, "resets_at": 333},
+        "secondary": {"used_percent": 33, "window_minutes": 10_080, "resets_at": 444},
+        "credits": {"hasCredits": False, "unlimited": False, "balance": "0"},
+        "plan_type": "prolite",
+        "rate_limit_reached_type": None,
+    }
+
+
+def test_codex_rate_limits_rejects_empty_app_server_snapshot():
+    result = {
+        "rateLimitsByLimitId": {
+            "codex": {
+                "limitId": "codex",
+                "planType": "prolite",
+            },
+        },
+    }
+
+    assert bot._normalize_codex_rate_limits_response(result) is None
 
 
 def test_channel_worker_single_turn_clean_reset(monkeypatch, tmp_path):

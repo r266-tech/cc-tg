@@ -37,6 +37,7 @@ _CODEX_SPLIT_ERRORS = (
     "Separator is found, but chunk is longer than limit",
 )
 _CODEX_STREAM_LIMIT = 64 * 1024 * 1024
+_CODEX_TOOL_RESULT_MAX_CHARS = 4000
 
 
 def _is_codex_split_error(message: str | None) -> bool:
@@ -135,9 +136,43 @@ def _extract_tool_name(item: dict[str, Any]) -> str | None:
     if item_type == "command_execution":
         command = str(item.get("command") or "shell")
         return command.split(None, 1)[0] if command else "shell"
+    if item_type.endswith("tool_call_output") or item_type in {"mcp_call_output", "function_call_output"}:
+        name = item.get("name") or item.get("tool_name")
+        return str(name) if name else None
     if item_type.endswith("tool_call") or item_type in {"mcp_call", "function_call"}:
         return str(item.get("name") or item.get("tool_name") or item_type)
     return None
+
+
+def _extract_tool_id(item: dict[str, Any]) -> str | None:
+    raw = item.get("call_id") or item.get("tool_call_id") or item.get("id")
+    return str(raw) if raw else None
+
+
+def _tool_result_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, default=str)
+        except Exception:
+            text = str(value)
+    if len(text) > _CODEX_TOOL_RESULT_MAX_CHARS:
+        return text[:_CODEX_TOOL_RESULT_MAX_CHARS].rstrip() + "..."
+    return text
+
+
+def _extract_tool_result(item: dict[str, Any]) -> dict[str, Any]:
+    is_error = bool(item.get("is_error") or item.get("error"))
+    for key in ("output", "result", "text", "content"):
+        value = item.get(key)
+        if value not in (None, ""):
+            return {"is_error": is_error, "text": _tool_result_text(value)}
+    if item.get("error"):
+        return {"is_error": True, "text": _tool_result_text(item.get("error"))}
+    return {"is_error": is_error, "text": ""}
 
 
 class CodexEngine(CC):
@@ -287,9 +322,14 @@ class CodexEngine(CC):
         sid: str | None = None
         content = ""
         tools: list[str] = []
+        running_tools: dict[str, str] = {}
         usage: dict[str, int] = {}
         streamed = False
         failure_message: str | None = None
+
+        def remember_tool(name: str) -> None:
+            if name not in tools:
+                tools.append(name)
 
         try:
             async for raw in proc.stdout:
@@ -318,8 +358,11 @@ class CodexEngine(CC):
                 if etype == "item.started":
                     item = event.get("item") or {}
                     name = _extract_tool_name(item)
-                    if name and name not in tools:
-                        tools.append(name)
+                    if name:
+                        remember_tool(name)
+                        item_id = _extract_tool_id(item)
+                        if item_id:
+                            running_tools[item_id] = name
                         if on_stream:
                             await on_stream(name, item, None, None)
                     continue
@@ -333,9 +376,16 @@ class CodexEngine(CC):
                                 await on_stream(None, None, text, None)
                                 streamed = True
                     else:
+                        item_id = _extract_tool_id(item)
                         name = _extract_tool_name(item)
-                        if name and name not in tools:
-                            tools.append(name)
+                        if not name and item_id:
+                            name = running_tools.get(item_id)
+                        if name:
+                            remember_tool(name)
+                            if item_id:
+                                running_tools.pop(item_id, None)
+                            if on_stream:
+                                await on_stream(None, None, None, _extract_tool_result(item))
                     continue
                 if etype == "turn.completed":
                     raw_usage = event.get("usage") or {}

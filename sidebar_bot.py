@@ -80,6 +80,11 @@ _PROACTIVE_PROMPT = """\
 proactive prompt 里带了 tab_id/window_id 时, mascot_speak/page_snapshot 都要原样传入,
 避免 V 切 tab 后说到别的页面上.
 
+浏览器控制路径优先级: 如果当前 CPU 是 Codex 且工具列表里看得到 Codex Chrome Extension /
+Chrome plugin / browser automation 这类 Codex 原生浏览器工具, 先用它们读写浏览器状态;
+不可见、未连接、权限失败或一次调用失败时, 立刻 fallback 到 sidebar MCP 的 page_snapshot /
+page_click_ref / mascot_speak / suggest_prompts 等本地工具, 不要反复撞同一路径.
+
 剩下选项就是沉默 (什么都不调).
 
 判断标准只有一条: V 此刻看到这页, 你作为最懂她的存在, 真的有"想说"的内容吗? 没有就闭嘴, 有就说. 区分"为说而说" vs "因事而说" — V 比谁都敏感.
@@ -113,6 +118,15 @@ Source: babata sidebar (浏览器扩展, channel #3).
 - translate(text, target_lang?) — Gemini 翻译, 默认 zh, 不带副作用
 - suggest_prompts(prompts) — 推 chip 到 sidepanel UI
 - mascot_speak(text, tab_id?, window_id?) — 当前页面桌宠气泡, 主动提醒/邀请用
+
+浏览器控制策略:
+- 第一优先级: 如果你当前可见的工具里有 Codex Chrome Extension / Chrome plugin /
+  browser automation 这类 Codex 原生浏览器工具, 对"我打开了哪些标签页"、"关闭某个浏览器标签页"、
+  当前浏览器点击/读取等请求先走这一路. V 默认把这一路当成 Edge 里的 Codex 扩展能力.
+- fallback: 如果这些工具不可见、未连接、权限失败或一次调用失败, 立刻改用 sidebar MCP 工具:
+  `tabs_query`, `tabs_close`, `page_snapshot`, `page_click_ref`, `tab_navigate`, `dom_*`.
+- 不要假装用过不可见的工具; 也不要在主路径失败后反复重试. 工具调用过程会自动记录到
+  sidepanel 的工具过程面板, 除非 V 追问, 回答里不需要复述日志.
 
 调用任何会读/改页面或导航的工具时, 优先把当前 page_context 里的 tab_id/window_id 传进去.
 不要在 V 已切走 tab 后误操作 lastFocusedWindow 的新 active tab.

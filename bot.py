@@ -1952,6 +1952,137 @@ def _codex_event_rate_limits(event: dict[str, Any]) -> dict[str, Any] | None:
     return rate_limits if isinstance(rate_limits, dict) else None
 
 
+def _codex_rate_limit_value(data: dict[str, Any], camel: str, snake: str) -> Any:
+    value = data.get(camel)
+    if value is None:
+        value = data.get(snake)
+    return value
+
+
+def _normalize_codex_rate_limit_window(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    used = _codex_rate_limit_value(value, "usedPercent", "used_percent")
+    if used is None:
+        return None
+    return {
+        "used_percent": used,
+        "window_minutes": _codex_rate_limit_value(value, "windowDurationMins", "window_minutes"),
+        "resets_at": _codex_rate_limit_value(value, "resetsAt", "resets_at"),
+    }
+
+
+def _normalize_codex_rate_limit_snapshot(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    primary = _normalize_codex_rate_limit_window(value.get("primary"))
+    secondary = _normalize_codex_rate_limit_window(value.get("secondary"))
+    if primary is None and secondary is None:
+        return None
+    return {
+        "limit_id": _codex_rate_limit_value(value, "limitId", "limit_id"),
+        "limit_name": _codex_rate_limit_value(value, "limitName", "limit_name"),
+        "primary": primary,
+        "secondary": secondary,
+        "credits": value.get("credits"),
+        "plan_type": _codex_rate_limit_value(value, "planType", "plan_type"),
+        "rate_limit_reached_type": _codex_rate_limit_value(
+            value,
+            "rateLimitReachedType",
+            "rate_limit_reached_type",
+        ),
+    }
+
+
+def _normalize_codex_rate_limits_response(result: Any) -> dict[str, Any] | None:
+    if not isinstance(result, dict):
+        return None
+    by_limit_id = result.get("rateLimitsByLimitId")
+    snapshot = None
+    if isinstance(by_limit_id, dict):
+        snapshot = by_limit_id.get("codex")
+        if not isinstance(snapshot, dict):
+            snapshot = next((v for v in by_limit_id.values() if isinstance(v, dict)), None)
+    if not isinstance(snapshot, dict):
+        snapshot = result.get("rateLimits") or result.get("rate_limits")
+    return _normalize_codex_rate_limit_snapshot(snapshot)
+
+
+async def _fetch_codex_app_rate_limits() -> dict[str, Any] | None:
+    """Read current Codex quota from the local app-server account API.
+
+    Session JSONL only updates when a Codex turn starts; this app-server method
+    refreshes the account-level rate-limit bucket without sending a model turn.
+    """
+    cli = _codex_cli_path()
+    if not cli:
+        return None
+    proc = None
+    try:
+        env = os.environ.copy()
+        env["CODEX_SKIP_AUTO_UPGRADE"] = "1"
+        proc = await asyncio.create_subprocess_exec(
+            cli,
+            "app-server",
+            "--listen",
+            "stdio://",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=env,
+            limit=1024 * 1024,
+        )
+        assert proc.stdin is not None
+        assert proc.stdout is not None
+        requests = [
+            {
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {"name": "babata-status", "version": "0"},
+                    "capabilities": {"experimentalApi": True},
+                },
+            },
+            {"id": 2, "method": "account/rateLimits/read"},
+        ]
+        for req in requests:
+            proc.stdin.write((json.dumps(req, separators=(",", ":")) + "\n").encode())
+        await proc.stdin.drain()
+
+        deadline = asyncio.get_running_loop().time() + 8.0
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return None
+            try:
+                raw = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
+            except asyncio.TimeoutError:
+                return None
+            if not raw:
+                return None
+            try:
+                msg = json.loads(raw.decode("utf-8", errors="replace"))
+            except Exception:
+                continue
+            if msg.get("id") != 2:
+                continue
+            if isinstance(msg.get("result"), dict):
+                return _normalize_codex_rate_limits_response(msg["result"])
+            return None
+    except Exception as e:
+        log.debug("codex app-server rate-limit refresh failed: %s", e)
+        return None
+    finally:
+        if proc is not None and proc.returncode is None:
+            if proc.stdin is not None:
+                with suppress(Exception):
+                    proc.stdin.close()
+            with suppress(ProcessLookupError, Exception):
+                proc.terminate()
+            with suppress(asyncio.TimeoutError, Exception):
+                await asyncio.wait_for(proc.wait(), timeout=1)
+
+
 def _codex_status_snapshot(sid: str | None) -> dict[str, Any]:
     """Best-effort Codex status from the same local files the CLI writes.
 
@@ -2419,6 +2550,9 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     if _current_cpu_name() == "codex":
         snap = _codex_status_snapshot(cc._session_id)
+        fresh_limits = await _fetch_codex_app_rate_limits()
+        if fresh_limits:
+            snap["rate_limits"] = fresh_limits
         snap_model = str(snap.get("model") or "")
         state_model = _last_model if _last_model and _last_model != "codex" else ""
         actual = (
@@ -2450,8 +2584,6 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         five_hour_line = _fmt_codex_limit(limits, "primary", "5h limit", 300)
         week_line = _fmt_codex_limit(limits, "secondary", "weekly limit", 10_080)
         plan_type = (limits or {}).get("plan_type") if isinstance(limits, dict) else None
-        current_model = str(snap.get("configured_model") or actual)
-        current_effort = str(snap.get("configured_effort") or effort or "—")
         sids = cc._load_state().get("recent_sids") or []
         sid_now = cc._session_id if cc._session_id else "(new)"
         labels = {0: "hidden", 1: "flash", 2: "keep"}
@@ -2471,7 +2603,6 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         lines += [
             "",
             f"Codex v{_codex_version()} · {labels.get(_verbose, _verbose)}",
-            f"current <code>{html.escape(current_model)}</code> · effort <code>{html.escape(current_effort)}</code>",
             f"<code>{sid_now}</code> · {len(sids)} recent",
         ]
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
