@@ -40,9 +40,6 @@ import sidebar_history
 from sidebar_bridge import bridge
 from sidebar_tool_registry import prompt_tool_lines
 from sidebar_translate import (
-    TranslateConfigError,
-    _get_http_client,
-    _load_openrouter_creds,
     translate_batch,
 )
 
@@ -107,14 +104,27 @@ proactive prompt 里带了 tab_id/window_id 时, mascot_speak/page_snapshot 都�
 """
 
 _PROACTIVE_INTENTS = {"auto", "prompt_suggestions", "agent_view"}
-_AGENT_VIEW_MODEL = os.environ.get("BABATA_AGENT_VIEW_MODEL", "anthropic/claude-sonnet-4-6")
 _AGENT_VIEW_SNAPSHOT_TIMEOUT_SEC = 2.5
-_AGENT_VIEW_HTTP_TIMEOUT_SEC = 10.0
-_AGENT_VIEW_MAX_TOKENS = 180
-_CLEAN_READ_MODEL = os.environ.get("BABATA_CLEAN_READ_MODEL", "anthropic/claude-sonnet-4-6")
-_CLEAN_READ_HTTP_TIMEOUT_SEC = float(os.environ.get("BABATA_CLEAN_READ_TIMEOUT_SEC", "90"))
-_CLEAN_READ_MAX_TOKENS = int(os.environ.get("BABATA_CLEAN_READ_MAX_TOKENS", "6000"))
+_AGENT_VIEW_TIMEOUT_SEC = float(os.environ.get("BABATA_AGENT_VIEW_TIMEOUT_SEC", "30"))
+_CLEAN_READ_TIMEOUT_SEC = float(os.environ.get("BABATA_CLEAN_READ_TIMEOUT_SEC", "120"))
 _CLEAN_READ_INPUT_MAX_CHARS = int(os.environ.get("BABATA_CLEAN_READ_INPUT_MAX_CHARS", "65000"))
+_AVATAR_CLAUDE_MODEL = os.environ.get("BABATA_SIDEBAR_AVATAR_MODEL", "claude-opus-4-7")
+
+_AGENT_VIEW_SOURCE_PROMPT = """\
+Source: babata sidebar avatar agent-view.
+
+你只处理用户双击头像触发的一句页面锐评/学习建议. 只根据 user prompt 里的
+title/url/visible lines 判断; 不读取文件, 不调用工具, 不引入 babata 记忆里的事实.
+输出必须是一句中文短句, 不要 markdown, 不要前言.
+"""
+
+_CLEAN_READ_SOURCE_PROMPT = """\
+Source: babata sidebar clean-read.
+
+你只处理用户三击头像触发的“净化阅读”. 只根据 user prompt 里的网页正文重构文章;
+不读取文件, 不调用工具, 不引入 babata 记忆里的事实, 不补写原文没有的信息.
+输出必须严格遵守 user prompt 要求的中文 Markdown 结构.
+"""
 
 
 def _normalize_proactive_intent(value: Any) -> str:
@@ -227,36 +237,16 @@ async def _agent_view_snapshot(
     return _compact_lines(result.get("lines"))
 
 
-async def _agent_view_complete(prompt: str) -> str:
-    base_url, tok = _load_openrouter_creds()
-    body = {
-        "model": _AGENT_VIEW_MODEL,
-        "max_tokens": _AGENT_VIEW_MAX_TOKENS,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    headers = {
-        "Authorization": f"Bearer {tok}",
-        "anthropic-version": "2023-06-01",
-        "Content-Type": "application/json",
-    }
-    client = _get_http_client()
-    resp = await asyncio.wait_for(
-        client.post(f"{base_url}/v1/messages", json=body, headers=headers),
-        timeout=_AGENT_VIEW_HTTP_TIMEOUT_SEC,
-    )
-    if resp.status_code != 200:
-        raise RuntimeError(f"agent_view http rc={resp.status_code}: {resp.text[:200]}")
-    data = resp.json()
-    content = data.get("content") or []
-    raw = "".join(
-        block.get("text", "")
-        for block in content
-        if isinstance(block, dict) and block.get("type") == "text"
-    )
-    text = _clean_agent_view_text(raw)
+async def _agent_view_complete(prompt: str) -> tuple[str, str]:
+    async with _agent_view_lock:
+        response = await asyncio.wait_for(
+            agent_view_cc.query(prompt),
+            timeout=_AGENT_VIEW_TIMEOUT_SEC,
+        )
+    text = _clean_agent_view_text(response.content)
     if not text:
         raise RuntimeError("agent_view empty model output")
-    return text
+    return text, response.model or _AVATAR_CLAUDE_MODEL
 
 
 async def _run_agent_view(
@@ -272,17 +262,14 @@ async def _run_agent_view(
             snapshot_lines = ""
             log.debug("agent_view snapshot unavailable: %s", e)
         prompt = _build_agent_view_prompt(url, title, snapshot_lines)
-        text = await _agent_view_complete(prompt)
+        text, model = await _agent_view_complete(prompt)
         await _agent_view_fallback(text, tab_id, window_id)
-        sidebar_events.append(url, "agent_view_speak", title=title, text=text[:160])
-    except TranslateConfigError as e:
-        log.error("agent_view config: %s", e)
-        await _agent_view_fallback("我现在没接上模型，先别等我。", tab_id, window_id)
+        sidebar_events.append(url, "agent_view_speak", title=title, text=text[:160], model=model)
     except asyncio.TimeoutError:
-        log.warning("agent_view direct http timed out after %.1fs", _AGENT_VIEW_HTTP_TIMEOUT_SEC)
+        log.warning("agent_view engine timed out after %.1fs", _AGENT_VIEW_TIMEOUT_SEC)
         await _agent_view_fallback("这页暂时没看清，别为它卡住。", tab_id, window_id)
     except Exception as e:
-        log.warning("agent_view direct failed: %s", e)
+        log.warning("agent_view engine failed: %s", e)
         await _agent_view_fallback("这页暂时没看清，别为它卡住。", tab_id, window_id)
 
 
@@ -366,33 +353,13 @@ def _clean_read_output(raw: str) -> str:
     return text or "净化阅读失败：模型返回为空。"
 
 
-async def _clean_read_complete(prompt: str) -> str:
-    base_url, tok = _load_openrouter_creds()
-    body = {
-        "model": _CLEAN_READ_MODEL,
-        "max_tokens": _CLEAN_READ_MAX_TOKENS,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    headers = {
-        "Authorization": f"Bearer {tok}",
-        "anthropic-version": "2023-06-01",
-        "Content-Type": "application/json",
-    }
-    client = _get_http_client()
-    resp = await asyncio.wait_for(
-        client.post(f"{base_url}/v1/messages", json=body, headers=headers),
-        timeout=_CLEAN_READ_HTTP_TIMEOUT_SEC,
-    )
-    if resp.status_code != 200:
-        raise RuntimeError(f"clean_read http rc={resp.status_code}: {resp.text[:300]}")
-    data = resp.json()
-    content = data.get("content") or []
-    raw = "".join(
-        block.get("text", "")
-        for block in content
-        if isinstance(block, dict) and block.get("type") == "text"
-    )
-    return _clean_read_output(raw)
+async def _clean_read_complete(prompt: str) -> tuple[str, str]:
+    async with _clean_read_lock:
+        response = await asyncio.wait_for(
+            clean_read_cc.query(prompt),
+            timeout=_CLEAN_READ_TIMEOUT_SEC,
+        )
+    return _clean_read_output(response.content), response.model or _AVATAR_CLAUDE_MODEL
 
 
 async def _notify_clean_read(action: str, args: dict[str, Any]) -> None:
@@ -411,7 +378,7 @@ async def _run_clean_read(
 ) -> None:
     try:
         prompt, truncated = _build_clean_read_prompt(url, title, article)
-        markdown = await _clean_read_complete(prompt)
+        markdown, model = await _clean_read_complete(prompt)
         sidebar_history.append("user", f"净化阅读：{title or url}", url=url, title=title)
         sidebar_history.append("assistant", markdown, url=url, title=title)
         await _notify_clean_read(
@@ -432,23 +399,10 @@ async def _run_clean_read(
             title=title,
             chars=article.get("char_count") or 0,
             truncated=truncated,
+            model=model,
         )
-    except TranslateConfigError as e:
-        log.error("clean_read config: %s", e)
-        await _notify_clean_read(
-            "clean_read_error",
-            {
-                "run_id": run_id,
-                "url": url,
-                "title": title,
-                "error": str(e),
-                "tab_id": tab_id,
-                "window_id": window_id,
-            },
-        )
-        await _agent_view_fallback("净读没接上模型，先看原文。", tab_id, window_id)
     except asyncio.TimeoutError:
-        log.warning("clean_read timed out after %.1fs", _CLEAN_READ_HTTP_TIMEOUT_SEC)
+        log.warning("clean_read timed out after %.1fs", _CLEAN_READ_TIMEOUT_SEC)
         await _notify_clean_read(
             "clean_read_error",
             {
@@ -560,9 +514,25 @@ proactive_cc = make_engine(
     },
 )
 
+agent_view_cc = make_engine(
+    state_file=STATE_DIR / f"{PROJECT}-sidebar-agent-view-session.json",
+    source_prompt=_AGENT_VIEW_SOURCE_PROMPT,
+    engine="claude",
+    model=_AVATAR_CLAUDE_MODEL,
+)
+
+clean_read_cc = make_engine(
+    state_file=STATE_DIR / f"{PROJECT}-sidebar-clean-read-session.json",
+    source_prompt=_CLEAN_READ_SOURCE_PROMPT,
+    engine="claude",
+    model=_AVATAR_CLAUDE_MODEL,
+)
+
 # 同 weixin_bot._cc_lock — 多 sidebar 并发 /chat 走 single-flight 防 session 撞.
 _cc_lock = asyncio.Lock()
 _proactive_lock = asyncio.Lock()
+_agent_view_lock = asyncio.Lock()
+_clean_read_lock = asyncio.Lock()
 
 
 # ── SSE helpers ───────────────────────────────────────────────────────
@@ -875,7 +845,7 @@ async def handle_translate_trace(request: web.Request) -> web.Response:
 async def handle_translate(request: web.Request) -> web.Response:
     """Content script POST batch 翻译. {site, target, batch:[{hash,text}]} →
     {ok, results:[{hash, translated}]}. L2 cache hit 直接返, miss spawn
-    `claude -p sonnet` (sidebar_translate.translate_batch 实现)."""
+    local Claude CLI one-shot (sidebar_translate.translate_batch 实现)."""
     rejected = _reject_untrusted_origin(request)
     if rejected:
         return rejected

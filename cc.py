@@ -753,10 +753,12 @@ class CC:
         state_file: Path,
         source_prompt: str,
         mcp_servers: dict[str, Any] | None = None,
+        model: str | None = None,
     ) -> None:
         self._state_file = state_file
         self._source_prompt = source_prompt
         self._mcp_servers = mcp_servers or {}
+        self._model = model
         self._session_id: str | None = self._load_state().get("session_id")
         self._memory_reflex_event_id: str | None = None
 
@@ -1225,6 +1227,7 @@ class CC:
             cli_path=os.environ.get("CLAUDE_CLI_PATH"),
             include_partial_messages=on_stream is not None,
             system_prompt=self._source_prompt_with_memory(user_prompt=prompt),
+            model=self._model,
             setting_sources=_SETTING_SOURCES,  # 默认 [] 隔离; BABATA_SHARED_CC=1 → ["user"] 共享
             mcp_servers=self._mcp_servers,
             # SDK 默认 max_buffer_size = 1MB; V 发 PDF/大图 或 resume 含 base64
@@ -1424,11 +1427,13 @@ class LiveSession(CC):
         state_file: Path,
         source_prompt: str,
         mcp_servers: dict[str, Any] | None = None,
+        model: str | None = None,
     ) -> None:
         super().__init__(
             state_file=state_file,
             source_prompt=source_prompt,
             mcp_servers=mcp_servers,
+            model=model,
         )
         self._client: ClaudeSDKClient | None = None
         self._inbox: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
@@ -1463,6 +1468,7 @@ class LiveSession(CC):
             cli_path=os.environ.get("CLAUDE_CLI_PATH"),
             include_partial_messages=True,
             system_prompt=system_prompt if system_prompt is not None else self._source_prompt_with_memory(),
+            model=self._model,
             setting_sources=_SETTING_SOURCES,
             mcp_servers=self._mcp_servers,
             # SDK 默认 1MB; PDF/大图 / base64 附件 resume 会爆 buffer (2026-04-22

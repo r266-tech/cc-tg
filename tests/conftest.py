@@ -27,6 +27,7 @@ class ClaudeAgentOptions:
     cwd: str | Path | None = None
     cli_path: str | Path | None = None
     include_partial_messages: bool = False
+    model: str | None = None
     setting_sources: list[str] | None = None
     max_buffer_size: int | None = None
     can_use_tool: Any = None

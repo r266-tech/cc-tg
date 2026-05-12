@@ -92,6 +92,7 @@ def make_engine(
     mcp_servers: dict[str, Any] | None = None,
     live: bool = False,
     engine: str | None = None,
+    model: str | None = None,
 ) -> CC | LiveSession | CodexEngine | CodexLiveSession:
     name = engine_name(state_file, override=engine)
     if name == "claude":
@@ -100,6 +101,7 @@ def make_engine(
             state_file=state_file,
             source_prompt=source_prompt,
             mcp_servers=mcp_servers,
+            model=model,
         )
     elif name == "codex":
         cls = CodexLiveSession if live else CodexEngine

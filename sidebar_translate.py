@@ -1,25 +1,23 @@
 """Sidebar batch translation engine.
 
 Content script POSTs {site, target, batch:[{hash,text}]} to /translate.
-Pipeline: dedup → L2 sqlite cache lookup → HTTP call (OpenRouter Anthropic-
-compatible /v1/messages, sonnet-4-6) for misses → write cache → return
+Pipeline: dedup -> L2 sqlite cache lookup -> local Claude CLI one-shot for
+misses -> write cache -> return
 [{hash, translated}]. L2 TTL 24h.
 
-V0 用 `claude -p` subprocess; 实测每 batch 5-27s (CLI cold start + LLM 推理),
-V 体感"一篇一篇缓慢出现". 改 OpenRouter HTTP 直调消除 CLI cold start ~1-2s,
-单 batch 落到 ~3-12s. 凭据走 cc-router providers.json (V /provider 单一入口).
+No third-party router/provider is used. This path intentionally stays a short-
+lived local Claude CLI call with tools disabled, so webpage text is not attached
+to the main sidebar chat session.
 """
 
 import asyncio
-import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import time
 from pathlib import Path
-
-import httpx
 
 import sidebar_events
 
@@ -27,9 +25,11 @@ log = logging.getLogger("babata.sidebar.translate")
 
 CACHE_DIR = Path.home() / ".babata" / "sidebar"
 CACHE_DB = CACHE_DIR / "translate_cache.sqlite"
+CLI_SANDBOX_DIR = CACHE_DIR / "translate-cli"
 TTL_SECONDS = 24 * 3600
 
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+CLI_SANDBOX_DIR.mkdir(parents=True, exist_ok=True)
 
 _LANG_NAMES = {
     "zh": "Simplified Chinese (简体中文)",
@@ -38,64 +38,53 @@ _LANG_NAMES = {
     "ko": "Korean (한국어)",
 }
 
-# OpenRouter HTTP 调用 — 不再 spawn 进程, 提高并发 (12 vs subprocess 3).
-# 实际并发上限受 OpenRouter rate limit 约束, 12 是 sonnet-4-6 OpenRouter 普通
-# tier 安全数 (~20 rpm), 超过会 429 被 backoff.
-_translate_sema = asyncio.Semaphore(12)
+# Claude CLI one-shot 有 cold start; 控制并发避免同页大量段落把本机和订阅额度打满.
+_TRANSLATE_CONCURRENCY = int(os.environ.get("BABATA_TRANSLATE_CONCURRENCY", "3"))
+_translate_sema = asyncio.Semaphore(max(1, _TRANSLATE_CONCURRENCY))
 
-# OpenRouter Anthropic 兼容 endpoint, 跟 cc-router providers.json convention 一致.
-_MODEL = "anthropic/claude-sonnet-4-6"
+# V 指定翻译也走 Claude Opus 4.7; 需要降级时显式 BABATA_TRANSLATE_MODEL=sonnet/opus.
+_MODEL = os.environ.get("BABATA_TRANSLATE_MODEL", "claude-opus-4-7").strip() or "claude-opus-4-7"
+_CLI_TIMEOUT_SEC = float(os.environ.get("BABATA_TRANSLATE_TIMEOUT_SEC", "120"))
 
 # 单次 LLM call 段数上限. V 实测 haiku 8+ 段易输出截断/非 JSON, 6 段稳定.
-# translate_batch 拆 CHUNK_SIZE 段并发 _http_translate (sem=12 限).
+# translate_batch 拆 CHUNK_SIZE 段并发 _cli_translate.
 _CHUNK_SIZE = 6
-
-# 凭据走 cc-router providers.json (`feedback_provider_sole_entry`: V 唯一入口).
-_CC_ROUTER_DIR = os.environ.get("BABATA_CC_ROUTER_DIR", "")
-_PROVIDERS_JSON = (
-    Path(_CC_ROUTER_DIR) / "providers.json" if _CC_ROUTER_DIR else None
-)
 
 
 class TranslateConfigError(RuntimeError):
-    """Raised when providers.json missing / unreadable / no openrouter provider —
-    config issue requires V intervention, not a transient failure."""
+    """Raised when the local translation CLI is missing or unusable."""
 
 
-def _load_openrouter_creds() -> tuple[str, str]:
-    """读 cc-router providers.json 找带 openrouter base_url 的 provider, 返
-    (base_url, token). 缺失/无效 raise TranslateConfigError —
-    `feedback_unhealable_must_escalate`: 不静默降级."""
-    if not _PROVIDERS_JSON or not _PROVIDERS_JSON.exists():
-        raise TranslateConfigError(
-            f"providers.json missing (BABATA_CC_ROUTER_DIR="
-            f"{_CC_ROUTER_DIR or '<unset>'})"
-        )
-    try:
-        data = json.loads(_PROVIDERS_JSON.read_text())
-    except (OSError, json.JSONDecodeError) as e:
-        raise TranslateConfigError(f"providers.json read failed: {e}") from e
-    for cfg in data.get("providers", {}).values():
-        env = cfg.get("env") or {}
-        burl = (env.get("ANTHROPIC_BASE_URL") or "").strip()
-        tok = (env.get("ANTHROPIC_AUTH_TOKEN") or "").strip()
-        if burl and tok and "openrouter" in burl.lower():
-            return (burl.rstrip("/"), tok)
-    raise TranslateConfigError(
-        "no openrouter provider in providers.json "
-        "(need ANTHROPIC_BASE_URL containing 'openrouter' + ANTHROPIC_AUTH_TOKEN)"
-    )
+def _claude_cli_path() -> str:
+    configured = os.environ.get("CLAUDE_CLI_PATH") or "claude"
+    if "/" in configured:
+        path = Path(configured).expanduser()
+        if path.is_file():
+            return str(path)
+        raise TranslateConfigError(f"CLAUDE_CLI_PATH not found: {configured}")
+    resolved = shutil.which(configured)
+    if resolved:
+        return resolved
+    raise TranslateConfigError(f"claude CLI not found on PATH: {configured}")
 
 
-_HTTP_CLIENT: httpx.AsyncClient | None = None
-
-
-def _get_http_client() -> httpx.AsyncClient:
-    global _HTTP_CLIENT
-    if _HTTP_CLIENT is None:
-        # connect=10s 容忍冷网络, read=60s 给 sonnet 长输出留余地.
-        _HTTP_CLIENT = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0))
-    return _HTTP_CLIENT
+def _claude_command() -> list[str]:
+    cmd = [
+        _claude_cli_path(),
+        "-p",
+        "--input-format",
+        "text",
+        "--output-format",
+        "text",
+        "--permission-mode",
+        "auto",
+        "--no-session-persistence",
+        "--disable-slash-commands",
+        "--tools",
+        "",
+    ]
+    cmd.extend(["--model", _MODEL])
+    return cmd
 
 
 def _conn():
@@ -200,87 +189,82 @@ def _parse_marker_results(raw: str, expected: int) -> list[str]:
     return out
 
 
-async def _http_translate(target: str, texts: list[str], url: str = "") -> list[str]:
-    """OpenRouter Anthropic-compatible /v1/messages 直调. 一次 batch 一次
-    HTTP. 失败返空 list (caller 不写 cache, 下次 retry).
+async def _cli_translate(target: str, texts: list[str], url: str = "") -> list[str]:
+    """Run one local Claude CLI translation batch.
 
-    429 自动 1 次 retry (sem=12 高并发可能撞 OpenRouter rate limit)."""
+    失败返空 list (caller 不写 cache, 下次 retry). 网页文本只进 stdin, 不进 argv,
+    避免长页面打爆 shell/exec 参数长度.
+    """
     if not texts:
         return []
     try:
-        base_url, tok = _load_openrouter_creds()
+        cmd = _claude_command()
     except TranslateConfigError as e:
         # 配置层故障 — 不是 transient. 写 events 让事件流可见, log.error 留痕.
         log.error("translate config: %s", e)
         sidebar_events.append(
-            url, "translate_config_error", reason=str(e)[:200], target=target
+            url, "translate_config_error", reason=str(e)[:200], target=target, model=_MODEL
         )
         return [""] * len(texts)
     prompt = _build_prompt(target, texts)
-    # max_tokens=8192 给 24 段 sonnet 输出留余地 (实测 5KB JSON ≈ 3K token).
-    body = {
-        "model": _MODEL,
-        "max_tokens": 8192,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    headers = {
-        "Authorization": f"Bearer {tok}",
-        "anthropic-version": "2023-06-01",
-        "Content-Type": "application/json",
-    }
-    client = _get_http_client()
-    resp = None
+    stdout = b""
+    stderr = b""
     async with _translate_sema:
         for attempt in range(2):
+            proc: asyncio.subprocess.Process | None = None
             try:
-                resp = await client.post(
-                    f"{base_url}/v1/messages", json=body, headers=headers
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=str(CLI_SANDBOX_DIR),
+                    env=os.environ.copy(),
                 )
-            except (httpx.HTTPError, asyncio.TimeoutError) as e:
-                log.warning("translate http error (attempt %d): %s", attempt, e)
-                if attempt == 0:
-                    await asyncio.sleep(1.0)
-                    continue
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(prompt.encode("utf-8")),
+                    timeout=_CLI_TIMEOUT_SEC,
+                )
+            except asyncio.TimeoutError:
+                if proc and proc.returncode is None:
+                    proc.kill()
+                    await proc.wait()
+                log.warning("translate cli timed out after %.1fs", _CLI_TIMEOUT_SEC)
                 return [""] * len(texts)
-            if resp.status_code == 429 and attempt == 0:
-                retry_after = resp.headers.get("retry-after", "1")
-                try:
-                    wait_s = min(max(float(retry_after), 0.5), 5.0)
-                except ValueError:
-                    wait_s = 1.0
-                log.info(
-                    "translate 429, backoff %.1fs (Retry-After=%s)",
-                    wait_s, retry_after,
+            except OSError as e:
+                log.error("translate cli spawn failed: %s", e)
+                sidebar_events.append(
+                    url, "translate_config_error", reason=str(e)[:200], target=target
                 )
-                await asyncio.sleep(wait_s)
+                return [""] * len(texts)
+
+            if proc.returncode == 0:
+                break
+            err = stderr.decode("utf-8", errors="replace").strip()
+            log.warning(
+                "translate cli rc=%s (attempt %d): %s",
+                proc.returncode,
+                attempt,
+                err[:500],
+            )
+            if attempt == 0:
+                await asyncio.sleep(1.0)
                 continue
-            break
-    if resp is None or resp.status_code != 200:
-        log.warning(
-            "translate http rc=%s body=%s",
-            resp.status_code if resp else "<no-resp>",
-            resp.text[:200] if resp else "",
-        )
-        return [""] * len(texts)
-    try:
-        data = resp.json()
-        content = data.get("content") or []
-        raw = "".join(
-            block.get("text", "")
-            for block in content
-            if isinstance(block, dict) and block.get("type") == "text"
-        ).strip()
-    except (ValueError, AttributeError, TypeError) as e:
-        log.warning("translate parse error: %s", e)
+            return [""] * len(texts)
+    raw = stdout.decode("utf-8", errors="replace").strip()
+    if not raw:
+        err = stderr.decode("utf-8", errors="replace").strip()
+        log.warning("translate cli empty output: %s", err[:500])
         return [""] * len(texts)
     parsed = _parse_marker_results(raw, len(texts))
-    # 全空 = parse fail / LLM truncate / 非合格 JSON. log raw 头尾便于诊断
+    # 全空 = parse fail / LLM truncate / 非合格 marker 输出. log raw 头尾便于诊断
     # (V 装上反复 fail 时看 server log 即可定位真因, 不用重启 debug).
     if all(not p for p in parsed):
         log.warning(
             "translate parse all-empty (n=%d): raw_head=%r raw_tail=%r",
             len(texts), raw[:300], raw[-200:] if len(raw) > 300 else "",
         )
+        return parsed
     # Sanity: 译文长度比原文短一半以上 → 可能 truncation, log 出来便于诊断.
     for orig, tr in zip(texts, parsed):
         if tr and len(tr) * 2 < len(orig):
@@ -321,17 +305,17 @@ async def translate_batch(site: str, target: str, batch: list[dict], url: str = 
         sidebar_events.append(url, "translate_hit", hash=h, target=target)
 
     if miss_texts:
-        sidebar_events.append(url, "translate_spawn", batch_size=len(miss_texts), target=target)
+        sidebar_events.append(url, "translate_spawn", batch_size=len(miss_texts), target=target, model=_MODEL)
         t0 = time.time()
-        # 拆批 — V 实测 14/10/9/8 段 batch 全 fail, 3 段 OK. haiku 大 batch 输出
-        # 易截断 / 非合格 JSON. 拆 CHUNK_SIZE 段并发 (asyncio.gather), sem=12 限并发.
+        # 拆批 — V 实测 14/10/9/8 段 batch 全 fail, 3 段 OK. 大 batch 输出
+        # 易截断 / 非合格 marker. 拆 CHUNK_SIZE 段并发 (asyncio.gather), sem 限并发.
         # 单 chunk fail 不影响其他 chunk (V 体感"部分翻部分不翻" → "更多翻成功").
         chunks = [
             miss_texts[i : i + _CHUNK_SIZE]
             for i in range(0, len(miss_texts), _CHUNK_SIZE)
         ]
         results_per_chunk = await asyncio.gather(
-            *(_http_translate(target, chunk, url=url) for chunk in chunks),
+            *(_cli_translate(target, chunk, url=url) for chunk in chunks),
             return_exceptions=False,
         )
         translated: list[str] = []
@@ -348,11 +332,11 @@ async def translate_batch(site: str, target: str, batch: list[dict], url: str = 
                 n_ok += 1
         _cache_put(to_cache)
         if n_ok == len(miss_texts):
-            sidebar_events.append(url, "translate_done", spawn_ms=spawn_ms, n=n_ok, target=target)
+            sidebar_events.append(url, "translate_done", spawn_ms=spawn_ms, n=n_ok, target=target, model=_MODEL)
         else:
             sidebar_events.append(
                 url, "translate_fail",
-                spawn_ms=spawn_ms, n_ok=n_ok, n_total=len(miss_texts), target=target,
+                spawn_ms=spawn_ms, n_ok=n_ok, n_total=len(miss_texts), target=target, model=_MODEL,
             )
 
     return [

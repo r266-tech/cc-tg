@@ -433,8 +433,10 @@ def test_claude_record_sid_updates_engine_specific_slot(tmp_path):
         source_prompt="Source: test.",
         live=False,
         engine="claude",
+        model="claude-opus-4-7",
     )
 
+    assert made._model == "claude-opus-4-7"
     made._record_sid("claude-sid")
 
     state = json.loads(state_file.read_text())
