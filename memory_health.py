@@ -11,8 +11,13 @@ from typing import Any
 
 # Threshold: memories should stay concise; 500 lines signals drift / bloat.
 LENGTH_THRESHOLD_LINES = 500
+# Hard cap for a single root fact. The 5KB guideline is soft; 8KiB means the
+# note should be compressed or split before it stays in atomic memory.
+BYTE_THRESHOLD = 8192
 # Legal types for frontmatter.
 LEGAL_TYPES = {"user", "feedback", "project", "reference"}
+LINK_TARGET_PATTERN = re.compile(r"\]\(([^)]+)\)")
+INDEX_COUNT_PATTERN = re.compile(r"\]\(indexes/([^)]+)\)\s*—\s*(\d+)\s*条")
 
 
 def parse_frontmatter(text: str) -> dict[str, str] | None:
@@ -64,30 +69,52 @@ def json_report(issues: dict[str, list[dict[str, Any]]]) -> None:
     print(json.dumps(issues, indent=2, ensure_ascii=False))
 
 
+def iter_markdown_links(path: Path) -> list[tuple[int, str]]:
+    links: list[tuple[int, str]] = []
+    for line_no, raw in enumerate(path.read_text().splitlines(), 1):
+        for target in LINK_TARGET_PATTERN.findall(raw):
+            target = target.strip()
+            if not target or target.startswith(("#", "http://", "https://")):
+                continue
+            links.append((line_no, target))
+    return links
+
+
+def resolve_memory_link(root: Path, source: Path, target: str) -> tuple[Path, Path] | None:
+    # Strip anchor fragments but keep relative paths.
+    target = target.split("#", 1)[0]
+    if not target:
+        return None
+    resolved = (source.parent / target).resolve()
+    try:
+        rel = resolved.relative_to(root.resolve())
+    except ValueError:
+        return None
+    return rel, resolved
+
+
+def is_root_memory_file(rel: Path) -> bool:
+    return len(rel.parts) == 1 and rel.suffix == ".md" and rel.name != "MEMORY.md"
+
+
+def is_index_file(rel: Path) -> bool:
+    return len(rel.parts) == 2 and rel.parts[0] == "indexes" and rel.suffix == ".md"
+
+
 def fix_orphans(root: Path, orphans: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Append orphan entries to MEMORY.md tail. Safe because we only touch the index."""
-    memory_md = root / "MEMORY.md"
-    if not memory_md.exists():
-        return [*orphans, {"file": "MEMORY.md", "line": 0, "detail": "MEMORY.md missing; cannot fix orphans"}]
-    lines_to_add: list[str] = []
-    for o in orphans:
-        filename = o["file"]
-        p = root / filename
-        title = filename
-        try:
-            fm = parse_frontmatter(p.read_text())
-            if fm and "name" in fm:
-                title = fm["name"]
-        except Exception:
-            pass
-        lines_to_add.append(f"- [{title}]({filename}) — auto-indexed by memory_health")
-    if lines_to_add:
-        content = memory_md.read_text()
-        if not content.endswith("\n"):
-            content += "\n"
-        content += "\n".join(lines_to_add) + "\n"
-        memory_md.write_text(content)
-    return []
+    """Do not auto-append facts to L0.
+
+    Since memory v2, MEMORY.md is a thin router. Classification requires choosing
+    an indexes/*.md category, so an automatic fix would re-inflate L0.
+    """
+    return [
+        {
+            "file": o["file"],
+            "line": 0,
+            "detail": "choose an indexes/*.md category manually; --fix will not append facts to MEMORY.md",
+        }
+        for o in orphans
+    ]
 
 
 def run(root: Path, *, json_mode: bool, fix_mode: bool, strict_mode: bool) -> int:
@@ -102,6 +129,7 @@ def run(root: Path, *, json_mode: bool, fix_mode: bool, strict_mode: bool) -> in
         "broken_link": [],
         "orphan": [],
         "duplicate_index": [],
+        "count_mismatch": [],
         "cross_dir_link": [],
         "missing_field": [],
         "invalid_type": [],
@@ -109,52 +137,108 @@ def run(root: Path, *, json_mode: bool, fix_mode: bool, strict_mode: bool) -> in
         "too_long": [],
     }
 
-    # ---- Parse MEMORY.md ----
+    # ---- Parse MEMORY.md as L0 router ----
     memory_md = root / "MEMORY.md"
     indexed: set[str] = set()
     seen_files: dict[str, int] = {}
-    entry_pattern = re.compile(r"^-\s*\[(.*?)\]\((.*?)\)\s*—\s*(.*)$")
+    declared_index_counts: dict[str, tuple[int, int]] = {}
 
     if memory_md.exists():
         for line_no, raw in enumerate(memory_md.read_text().splitlines(), 1):
-            raw = raw.strip()
-            if not raw.startswith("-"):
-                continue
-            m = entry_pattern.match(raw)
-            if not m:
-                continue
-            _, filename, _ = m.groups()
-            filename = filename.strip()
+            m = INDEX_COUNT_PATTERN.search(raw)
+            if m:
+                declared_index_counts[m.group(1)] = (int(m.group(2)), line_no)
 
-            # Extra check: root index should never reference subdirs (daily/archive/rollup
-            # maintain their own aggregation; cross-directory links fracture hierarchy).
-            if "/" in filename:
+        for line_no, target in iter_markdown_links(memory_md):
+            resolved = resolve_memory_link(root, memory_md, target)
+            if resolved is None:
                 issues["cross_dir_link"].append(
-                    {"file": "MEMORY.md", "line": line_no, "detail": f"references subdirectory file '{filename}'"}
+                    {"file": "MEMORY.md", "line": line_no, "detail": f"points outside memory root: '{target}'"}
                 )
                 continue
+            rel, fpath = resolved
 
-            # Check 1: points to non-existent file
-            fpath = root / filename
             if not fpath.exists():
                 issues["broken_link"].append(
-                    {"file": "MEMORY.md", "line": line_no, "detail": f"points to missing '{filename}'"}
+                    {"file": "MEMORY.md", "line": line_no, "detail": f"points to missing '{target}'"}
                 )
                 continue
 
-            # Check 3: same file indexed more than once
-            if filename in seen_files:
-                issues["duplicate_index"].append(
-                    {"file": "MEMORY.md", "line": line_no, "detail": f"duplicate of line {seen_files[filename]} for '{filename}'"}
+            # L0 may link to root hot facts and to indexes/*.md category routers.
+            if not (is_root_memory_file(rel) or is_index_file(rel)):
+                issues["cross_dir_link"].append(
+                    {"file": "MEMORY.md", "line": line_no, "detail": f"unexpected L0 target '{target}'"}
                 )
-            else:
-                seen_files[filename] = line_no
+                continue
 
-            indexed.add(filename)
+            if is_root_memory_file(rel):
+                if rel.name in seen_files:
+                    issues["duplicate_index"].append(
+                        {"file": "MEMORY.md", "line": line_no, "detail": f"duplicate of line {seen_files[rel.name]} for '{rel.name}'"}
+                    )
+                else:
+                    seen_files[rel.name] = line_no
+                indexed.add(rel.name)
     else:
         issues["broken_link"].append(
             {"file": "MEMORY.md", "line": 0, "detail": "MEMORY.md does not exist"}
         )
+
+    # ---- Parse category indexes ----
+    indexes_dir = root / "indexes"
+    category_counts: dict[str, int] = {}
+    category_seen_files: dict[str, tuple[str, int]] = {}
+    if indexes_dir.is_dir():
+        for index_file in sorted(indexes_dir.glob("[0-9][0-9]-*.md")):
+            category_counts[index_file.name] = 0
+            for line_no, target in iter_markdown_links(index_file):
+                resolved = resolve_memory_link(root, index_file, target)
+                if resolved is None:
+                    issues["cross_dir_link"].append(
+                        {"file": f"indexes/{index_file.name}", "line": line_no, "detail": f"points outside memory root: '{target}'"}
+                    )
+                    continue
+                rel, fpath = resolved
+                if not fpath.exists():
+                    issues["broken_link"].append(
+                        {"file": f"indexes/{index_file.name}", "line": line_no, "detail": f"points to missing '{target}'"}
+                    )
+                    continue
+                if is_root_memory_file(rel):
+                    category_counts[index_file.name] += 1
+                    if rel.name in category_seen_files:
+                        prev_file, prev_line = category_seen_files[rel.name]
+                        issues["duplicate_index"].append(
+                            {
+                                "file": f"indexes/{index_file.name}",
+                                "line": line_no,
+                                "detail": f"'{rel.name}' also indexed at indexes/{prev_file}:{prev_line}",
+                            }
+                        )
+                    else:
+                        category_seen_files[rel.name] = (index_file.name, line_no)
+                    indexed.add(rel.name)
+                else:
+                    issues["cross_dir_link"].append(
+                        {"file": f"indexes/{index_file.name}", "line": line_no, "detail": f"unexpected category target '{target}'"}
+                    )
+
+        for index_name, actual_count in category_counts.items():
+            declared = declared_index_counts.get(index_name)
+            if declared is None:
+                issues["count_mismatch"].append(
+                    {"file": f"indexes/{index_name}", "line": 0, "detail": "missing count entry in MEMORY.md"}
+                )
+                continue
+            declared_count, memory_line = declared
+            if declared_count != actual_count:
+                issues["count_mismatch"].append(
+                    {
+                        "file": "MEMORY.md",
+                        "line": memory_line,
+                        "detail": f"{index_name} declares {declared_count} 条 but index has {actual_count}",
+                    }
+                )
 
     # ---- Scan root-level memory files ----
     root_md_files: list[Path] = []
@@ -162,11 +246,11 @@ def run(root: Path, *, json_mode: bool, fix_mode: bool, strict_mode: bool) -> in
         if p.is_file() and p.suffix == ".md" and p.name != "MEMORY.md":
             root_md_files.append(p)
 
-    # Check 2: root files not indexed in MEMORY.md (daily/archive/rollup excluded by design)
+    # Check 2: root files not indexed in MEMORY.md or indexes/*.md
     orphans: list[dict[str, Any]] = []
     for p in root_md_files:
         if p.name not in indexed:
-            orphans.append({"file": p.name, "line": 0, "detail": f"exists but not indexed in MEMORY.md"})
+            orphans.append({"file": p.name, "line": 0, "detail": "exists but is not linked from MEMORY.md or indexes/*.md"})
             issues["orphan"].append(orphans[-1])
 
     # ---- Per-file checks ----
@@ -196,9 +280,14 @@ def run(root: Path, *, json_mode: bool, fix_mode: bool, strict_mode: bool) -> in
         # else: meta doc without frontmatter — only universal length check below applies.
 
         # Check 5: excessive length
-        if len(lines) > LENGTH_THRESHOLD_LINES:
+        byte_len = len(text.encode())
+        if len(lines) > LENGTH_THRESHOLD_LINES or byte_len > BYTE_THRESHOLD:
             issues["too_long"].append(
-                {"file": p.name, "line": 0, "detail": f"{len(lines)} lines > threshold {LENGTH_THRESHOLD_LINES}"}
+                {
+                    "file": p.name,
+                    "line": 0,
+                    "detail": f"{len(lines)} lines / {byte_len} bytes exceeds {LENGTH_THRESHOLD_LINES} lines or {BYTE_THRESHOLD} bytes",
+                }
             )
 
     # ---- Fix mode ----
@@ -225,7 +314,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Structural health scanner for babata memory directory")
     parser.add_argument("--root", required=True, help="Path to memory directory")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
-    parser.add_argument("--fix", action="store_true", help="Fix safe issues (append orphans to MEMORY.md)")
+    parser.add_argument("--fix", action="store_true", help="Reserved for safe fixes; does not auto-append facts to MEMORY.md")
     parser.add_argument("--strict", action="store_true", help="Exit non-zero if any issue found")
     args = parser.parse_args()
 

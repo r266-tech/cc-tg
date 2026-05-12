@@ -6,6 +6,7 @@ because strip_markdown's pair-matching regexes fail on broken pairs.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 from pathlib import Path
@@ -20,6 +21,12 @@ os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123:test")
 os.environ.setdefault("ALLOWED_USER_ID", "0")
 
 import weixin_bot as wb
+from cc import Response
+
+
+def reset_wx_pending(monkeypatch, tmp_path):
+    monkeypatch.setattr(wb, "PENDING_WX_UPDATES_FILE", tmp_path / "wx-pending.json")
+    wb._pending_wx_records = {}
 
 
 # ── _md_balanced ────────────────────────────────────────────────────
@@ -322,3 +329,345 @@ def test_md_balanced_unclosable_buf_returns_false_throughout():
     assert wb._md_balanced(text[:0]) is True
     for i in range(1, len(text) + 1):
         assert wb._md_balanced(text[:i]) is False, f"prefix[:{i}] should be unbalanced"
+
+
+# ── WeChat turn recovery / cursor commit ────────────────────────────
+
+
+def test_weixin_process_retries_same_turn_before_failure_reply(monkeypatch):
+    class FakeCC:
+        def __init__(self):
+            self.prompts: list[str] = []
+
+        async def query(self, prompt, *, images=None, on_stream=None):
+            self.prompts.append(prompt)
+            if len(self.prompts) == 1:
+                raise RuntimeError("boom")
+            if on_stream:
+                await on_stream(None, None, "ok", None)
+            return Response(content="ok", session_id="sid-1", cost=0.0)
+
+    class FakeClient:
+        def __init__(self):
+            self.sent: list[str] = []
+
+        async def get_config(self, *_args, **_kwargs):
+            return {}
+
+        async def send_message(self, _to_user, items, **_kwargs):
+            self.sent.extend((item.get("text_item") or {}).get("text", "") for item in items)
+
+    async def run():
+        fake_cc = FakeCC()
+        client = FakeClient()
+        monkeypatch.setattr(wb, "cc", fake_cc)
+        monkeypatch.setattr(wb, "_WX_MAX_TURN_RECOVERY_ATTEMPTS", 1)
+        msg = {
+            "from_user_id": "u1",
+            "context_token": "ctx",
+            "item_list": [
+                {"type": wb.ITEM_TEXT, "text_item": {"text": "hello"}},
+            ],
+        }
+
+        consumed = await wb._process_combined_msgs(client, [msg], "acc")
+
+        assert consumed is True
+        assert fake_cc.prompts == ["hello", "hello"]
+        assert client.sent == ["ok"]
+        assert not any("处理失败" in text for text in client.sent)
+
+    asyncio.run(run())
+
+
+def test_weixin_sync_buf_saved_after_message_processing(monkeypatch, tmp_path):
+    saved: list[str] = []
+    processed: list[str] = []
+    reset_wx_pending(monkeypatch, tmp_path)
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            self.calls = 0
+
+        async def get_updates(self, _buf):
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "get_updates_buf": "new-buf",
+                    "msgs": [{"message_type": 1, "from_user_id": "u1"}],
+                }
+            await asyncio.sleep(3600)
+
+    async def fake_heartbeat(_client, _account_id):
+        return None
+
+    async def run():
+        processing_started = asyncio.Event()
+        allow_finish = asyncio.Event()
+
+        async def fake_enqueue(_client, msg, _account_id):
+            assert saved == []
+            processing_started.set()
+            await allow_finish.wait()
+            processed.append(msg["from_user_id"])
+            return True
+
+        monkeypatch.setattr(wb, "load_account", lambda _account_id: {
+            "baseUrl": "https://example.test",
+            "token": "token",
+        })
+        monkeypatch.setattr(wb, "load_sync_buf", lambda _account_id: "old-buf")
+        monkeypatch.setattr(wb, "save_sync_buf", lambda _account_id, buf: saved.append(buf))
+        monkeypatch.setattr(wb, "WeixinClient", FakeClient)
+        monkeypatch.setattr(wb, "_enqueue_inbound_msg", fake_enqueue)
+        monkeypatch.setattr(wb, "_heartbeat_loop", fake_heartbeat)
+
+        task = asyncio.create_task(wb._run_account("acc"))
+        await asyncio.wait_for(processing_started.wait(), timeout=1)
+        assert saved == []
+
+        allow_finish.set()
+        await asyncio.wait_for(_wait_until(lambda: saved == ["new-buf"]), timeout=1)
+        assert processed == ["u1"]
+        assert wb._pending_wx_records == {}
+
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    async def _wait_until(predicate):
+        while not predicate():
+            await asyncio.sleep(0.01)
+
+    asyncio.run(run())
+
+
+def test_weixin_sync_buf_not_saved_when_processing_unconsumed(monkeypatch, tmp_path):
+    saved: list[str] = []
+    reset_wx_pending(monkeypatch, tmp_path)
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            self.calls = 0
+
+        async def get_updates(self, _buf):
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "get_updates_buf": "new-buf",
+                    "msgs": [{"message_type": 1, "from_user_id": "u1"}],
+                }
+            await asyncio.sleep(3600)
+
+    async def fake_heartbeat(_client, _account_id):
+        return None
+
+    async def run():
+        async def fake_enqueue(_client, _msg, _account_id):
+            return False
+
+        monkeypatch.setattr(wb, "load_account", lambda _account_id: {
+            "baseUrl": "https://example.test",
+            "token": "token",
+        })
+        monkeypatch.setattr(wb, "load_sync_buf", lambda _account_id: "old-buf")
+        monkeypatch.setattr(wb, "save_sync_buf", lambda _account_id, buf: saved.append(buf))
+        monkeypatch.setattr(wb, "WeixinClient", FakeClient)
+        monkeypatch.setattr(wb, "_enqueue_inbound_msg", fake_enqueue)
+        monkeypatch.setattr(wb, "_heartbeat_loop", fake_heartbeat)
+
+        task = asyncio.create_task(wb._run_account("acc"))
+        await asyncio.sleep(0.05)
+        assert saved == []
+        assert len(wb._pending_wx_records) == 1
+
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(run())
+
+
+def test_weixin_poll_batch_coalesces_same_sender_messages(monkeypatch, tmp_path):
+    prompts: list[str] = []
+    saved: list[str] = []
+    reset_wx_pending(monkeypatch, tmp_path)
+
+    class FakeCC:
+        async def query(self, prompt, images=None, on_stream=None):
+            prompts.append(prompt)
+            return Response(content="ok", session_id="sid-1", cost=0.0)
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            self.calls = 0
+            self.sent: list[str] = []
+
+        async def get_updates(self, _buf):
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "get_updates_buf": "new-buf",
+                    "msgs": [
+                        {
+                            "message_type": 1,
+                            "from_user_id": "u1",
+                            "context_token": "ctx1",
+                            "item_list": [
+                                {"type": wb.ITEM_TEXT, "text_item": {"text": "first"}},
+                            ],
+                        },
+                        {
+                            "message_type": 1,
+                            "from_user_id": "u1",
+                            "context_token": "ctx2",
+                            "item_list": [
+                                {"type": wb.ITEM_TEXT, "text_item": {"text": "second"}},
+                            ],
+                        },
+                    ],
+                }
+            await asyncio.sleep(3600)
+
+        async def get_config(self, *_args, **_kwargs):
+            return {}
+
+        async def send_message(self, _to_user, items, **_kwargs):
+            self.sent.extend((item.get("text_item") or {}).get("text", "") for item in items)
+
+    async def fake_heartbeat(_client, _account_id):
+        return None
+
+    async def run():
+        monkeypatch.setattr(wb, "cc", FakeCC())
+        monkeypatch.setattr(wb, "is_allowed", lambda _account_id, _from_user: True)
+        monkeypatch.setattr(wb, "set_context_token", lambda *_args: None)
+        monkeypatch.setattr(wb, "load_account", lambda _account_id: {
+            "baseUrl": "https://example.test",
+            "token": "token",
+        })
+        monkeypatch.setattr(wb, "load_sync_buf", lambda _account_id: "old-buf")
+        monkeypatch.setattr(wb, "save_sync_buf", lambda _account_id, buf: saved.append(buf))
+        monkeypatch.setattr(wb, "WeixinClient", FakeClient)
+        monkeypatch.setattr(wb, "_heartbeat_loop", fake_heartbeat)
+
+        task = asyncio.create_task(wb._run_account("acc"))
+        await asyncio.wait_for(_wait_until(lambda: saved == ["new-buf"]), timeout=1)
+        assert len(prompts) == 1
+        assert "WeChat messages" in prompts[0]
+        assert "<user_message n=1>" in prompts[0]
+        assert "first" in prompts[0]
+        assert "<user_message n=2>" in prompts[0]
+        assert "second" in prompts[0]
+        assert wb._pending_wx_records == {}
+
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    async def _wait_until(predicate):
+        while not predicate():
+            await asyncio.sleep(0.01)
+
+    asyncio.run(run())
+
+
+def test_weixin_pending_journal_replays_and_acks(monkeypatch, tmp_path):
+    prompts: list[str] = []
+    saved: list[str] = []
+    current_buf = {"value": "old-buf"}
+    reset_wx_pending(monkeypatch, tmp_path)
+
+    wb._pending_wx_records = {
+        "r1": {
+            "id": "r1",
+            "account_id": "acc",
+            "new_buf": "new-buf",
+            "received_at": 1,
+            "units": [[
+                {
+                    "message_type": 1,
+                    "from_user_id": "u1",
+                    "context_token": "ctx1",
+                    "item_list": [
+                        {"type": wb.ITEM_TEXT, "text_item": {"text": "first"}},
+                    ],
+                },
+                {
+                    "message_type": 1,
+                    "from_user_id": "u1",
+                    "context_token": "ctx2",
+                    "item_list": [
+                        {"type": wb.ITEM_TEXT, "text_item": {"text": "second"}},
+                    ],
+                },
+            ]],
+        }
+    }
+
+    class FakeCC:
+        async def query(self, prompt, images=None, on_stream=None):
+            prompts.append(prompt)
+            return Response(content="ok", session_id="sid-1", cost=0.0)
+
+    class FakeClient:
+        async def get_config(self, *_args, **_kwargs):
+            return {}
+
+        async def send_message(self, *_args, **_kwargs):
+            return None
+
+    async def run():
+        monkeypatch.setattr(wb, "cc", FakeCC())
+        monkeypatch.setattr(wb, "is_allowed", lambda _account_id, _from_user: True)
+        monkeypatch.setattr(wb, "set_context_token", lambda *_args: None)
+        monkeypatch.setattr(wb, "load_sync_buf", lambda _account_id: current_buf["value"])
+
+        def save_buf(_account_id, buf):
+            current_buf["value"] = buf
+            saved.append(buf)
+
+        monkeypatch.setattr(wb, "save_sync_buf", save_buf)
+
+        await wb._replay_pending_wx_updates(FakeClient(), "acc")
+
+        assert saved == ["new-buf"]
+        assert current_buf["value"] == "new-buf"
+        assert wb._pending_wx_records == {}
+        assert len(prompts) == 1
+        assert "first" in prompts[0]
+        assert "second" in prompts[0]
+
+    asyncio.run(run())
+
+
+def test_weixin_pending_journal_keeps_unconsumed_batch(monkeypatch, tmp_path):
+    saved: list[str] = []
+    reset_wx_pending(monkeypatch, tmp_path)
+    wb._pending_wx_records = {
+        "r1": {
+            "id": "r1",
+            "account_id": "acc",
+            "new_buf": "new-buf",
+            "received_at": 1,
+            "units": [[{"message_type": 1, "from_user_id": "u1"}]],
+        }
+    }
+
+    async def run():
+        monkeypatch.setattr(wb, "load_sync_buf", lambda _account_id: "old-buf")
+        monkeypatch.setattr(wb, "save_sync_buf", lambda _account_id, buf: saved.append(buf))
+        monkeypatch.setattr(wb, "_process_wx_units", lambda *_args: asyncio.sleep(0, result=False))
+
+        await wb._replay_pending_wx_updates(object(), "acc")
+
+        assert saved == []
+        assert "r1" in wb._pending_wx_records
+
+    asyncio.run(run())

@@ -38,6 +38,7 @@ from media import image_to_base64, understand_video  # noqa: F401  (image_to_bas
 import sidebar_events
 import sidebar_history
 from sidebar_bridge import bridge
+from sidebar_tool_registry import prompt_tool_lines
 from sidebar_translate import (
     TranslateConfigError,
     _get_http_client,
@@ -475,6 +476,8 @@ async def _run_clean_read(
         )
         await _agent_view_fallback("净读失败，先看原文。", tab_id, window_id)
 
+_SIDEBAR_TOOL_LINES = prompt_tool_lines()
+
 _SIDEBAR_SOURCE_PROMPT = """\
 Source: babata sidebar (浏览器扩展, channel #3).
 
@@ -489,20 +492,7 @@ Source: babata sidebar (浏览器扩展, channel #3).
 - 克制: 不每次都抓页面, 不每次都推 chip, 不每次都发声. 由你基于用户当前意图判断.
 
 工具能力 (raw primitive, compose 起来做任意工作):
-- tab_metadata() — url / title / 当前选中 / scrollY / docHeight / 页面 lang
-- dom_query(selector, root?, limit?, props?) — querySelectorAll → 元素属性 array
-- dom_inject(selector, html, position?) — insertAdjacentHTML 注入
-- dom_set(selector, prop, value) — 设 value (附 input/change 事件) / textContent / attribute
-- dom_click(selector) — 合成 click; 受保护按钮可能不接受, 失败就说明限制
-- page_snapshot(tab_id?, window_id?, limit?) — 当前可见页面地图: ref / role / name / selector / rect / is_new
-- page_click_ref(snapshot_id, ref) — 按 page_snapshot 的 ref 点击元素, 比凭空猜 selector 稳
-- tab_navigate(url) — chrome.tabs.update
-- translate(text, target_lang?) — server LLM 翻译, 默认 zh, 不带副作用
-- suggest_prompts(prompts) — 推 chip 到 sidepanel UI
-- mascot_speak(text, tab_id?, window_id?) — 当前页面桌宠气泡, 主动提醒/邀请用
-- bookmarks_search(query), bookmarks_tree(), bookmarks_create(title, url, parent_id?) — 书签读写
-- tabs_query(...), tabs_close(tab_ids), tabs_group(tab_ids, group_title?, color?) — tab 管理; 关闭 tab 要有清楚用户意图
-- history_search(text, start_ms?, end_ms?, max_results?) — 浏览历史搜索
+""" + _SIDEBAR_TOOL_LINES + """
 
 工具使用策略:
 - 你当前只能调用 sidebar MCP 暴露的工具. DevTools/CDP/Computer Use/Playwright/AppleScript

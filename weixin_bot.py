@@ -15,6 +15,7 @@ contextToken routing, markdown stripping for WeChat's plain-text display.
 import asyncio
 import base64
 import fcntl
+import json
 import logging
 import os
 import re
@@ -53,6 +54,8 @@ _HEARTBEAT_ME = STATE_DIR / f"{PROJECT}-weixin-heartbeat"
 _HEARTBEAT_PEER = STATE_DIR / f"{PROJECT}-tg-heartbeat"
 _HEARTBEAT_STALE_S = 180
 _HEARTBEAT_INTERVAL_S = 30
+
+PENDING_WX_UPDATES_FILE = STATE_DIR / f"{PROJECT}-weixin-pending-updates.json"
 
 
 async def _heartbeat_loop(client: "WeixinClient", account_id: str) -> None:
@@ -490,26 +493,129 @@ def _describe_ref(ref: dict[str, Any] | None) -> str:
 # burst). Non-image without a pending burst bypasses debounce entirely.
 _MESSAGE_DEBOUNCE_S = 3.0
 _pending: dict[tuple[str, str], dict[str, Any]] = {}
+# A recoverable CPU failure must not permanently drop the inbound WeChat turn.
+# Retry the same decoded burst before the caller advances to later updates.
+_WX_MAX_TURN_RECOVERY_ATTEMPTS = int(
+    os.environ.get(
+        "BABATA_WX_TURN_RECOVERY_ATTEMPTS",
+        os.environ.get("BABATA_TURN_RECOVERY_ATTEMPTS", "2"),
+    )
+)
+_wx_processing_tasks: set[asyncio.Task] = set()
+_pending_wx_lock = asyncio.Lock()
+
+
+def _load_pending_wx_updates() -> dict[str, dict[str, Any]]:
+    if not PENDING_WX_UPDATES_FILE.exists():
+        return {}
+    try:
+        data = json.loads(PENDING_WX_UPDATES_FILE.read_text())
+        records = data.get("pending", {})
+        if isinstance(records, dict):
+            return {str(k): v for k, v in records.items() if isinstance(v, dict)}
+    except Exception as e:
+        log.warning("wx pending-updates load failed: %s, treating as empty", e)
+    return {}
+
+
+_pending_wx_records: dict[str, dict[str, Any]] = _load_pending_wx_updates()
+
+
+def _write_pending_wx_locked() -> None:
+    tmp = PENDING_WX_UPDATES_FILE.with_suffix(".json.partial")
+    PENDING_WX_UPDATES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp.write_text(
+        json.dumps(
+            {"pending": _pending_wx_records},
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    os.replace(tmp, PENDING_WX_UPDATES_FILE)
+
+
+async def _record_pending_wx_batch(
+    account_id: str,
+    *,
+    new_buf: str,
+    units: list[list[dict[str, Any]]],
+) -> str:
+    record_id = f"{int(time.time() * 1000)}-{secrets.token_hex(4)}"
+    record = {
+        "id": record_id,
+        "account_id": account_id,
+        "new_buf": new_buf,
+        "units": units,
+        "received_at": time.time(),
+    }
+    async with _pending_wx_lock:
+        _pending_wx_records[record_id] = record
+        _write_pending_wx_locked()
+    return record_id
+
+
+async def _ack_pending_wx_batch(record_id: str) -> None:
+    async with _pending_wx_lock:
+        if record_id not in _pending_wx_records:
+            return
+        _pending_wx_records.pop(record_id, None)
+        _write_pending_wx_locked()
+
+
+async def _pending_wx_batches_for_account(account_id: str) -> list[dict[str, Any]]:
+    async with _pending_wx_lock:
+        records = [
+            dict(record)
+            for record in _pending_wx_records.values()
+            if record.get("account_id") == account_id
+        ]
+    return sorted(records, key=lambda r: r.get("received_at", 0))
+
+
 # Single-flight across all users/accounts: concurrent CC queries would race
 # on the shared session resume (session_id written per query end).
 _cc_lock = asyncio.Lock()
 
 
+def _track_wx_processing_task(task: asyncio.Task) -> asyncio.Task:
+    _wx_processing_tasks.add(task)
+    task.add_done_callback(_wx_processing_tasks.discard)
+    return task
+
+
 async def _enqueue_inbound_msg(
     client: WeixinClient, msg: dict[str, Any], account_id: str
-) -> None:
-    from_user = msg.get("from_user_id") or ""
-    ctx_token = msg.get("context_token")
+) -> asyncio.Task | bool:
+    return await _enqueue_inbound_msgs(client, [msg], account_id)
 
-    if from_user and ctx_token:
-        set_context_token(account_id, from_user, ctx_token)
+
+async def _enqueue_inbound_msgs(
+    client: WeixinClient, msgs: list[dict[str, Any]], account_id: str
+) -> asyncio.Task | bool:
+    if not msgs:
+        return True
+
+    from_user = msgs[0].get("from_user_id") or ""
+    for msg in msgs:
+        ctx_token = msg.get("context_token")
+        if from_user and ctx_token:
+            set_context_token(account_id, from_user, ctx_token)
 
     if not is_allowed(account_id, from_user):
         log.warning("ignoring unauthorized from=%s", from_user)
-        return
+        return True
 
-    items = msg.get("item_list") or []
-    has_image = any(item.get("type") == ITEM_IMAGE for item in items)
+    has_image = any(
+        item.get("type") == ITEM_IMAGE
+        for msg in msgs
+        for item in (msg.get("item_list") or [])
+    )
+    has_non_image = any(
+        item.get("type") != ITEM_IMAGE
+        for msg in msgs
+        for item in (msg.get("item_list") or [])
+    )
 
     key = (account_id, from_user)
     pending = _pending.get(key)
@@ -517,37 +623,39 @@ async def _enqueue_inbound_msg(
     if pending is not None:
         # Inside an active burst: always append, and if this is non-image
         # (text/voice/video/file) mark the burst complete for immediate flush.
-        pending["msgs"].append(msg)
+        pending["msgs"].extend(msgs)
         pending["last_arrival_at"] = time.monotonic()
-        if not has_image:
+        if has_non_image:
             pending["non_image_arrived"].set()
-        return
+        return pending.get("task")
 
-    if not has_image:
+    if not has_image or has_non_image:
         # No pending burst + no image — straight to CC, no debounce.
         async with _cc_lock:
             try:
-                await _process_combined_msgs(client, [msg], account_id)
+                return await _process_combined_msgs(client, msgs, account_id)
             except Exception:
                 log.exception("msg processing crashed")
-        return
+                return False
 
     # Image starts a burst that waits for the follow-up.
     pending = {
-        "msgs": [msg],
+        "msgs": list(msgs),
         "client": client,
         "account_id": account_id,
         "last_arrival_at": time.monotonic(),
         "non_image_arrived": asyncio.Event(),
     }
+    task = _track_wx_processing_task(asyncio.create_task(_flush_pending(key)))
+    pending["task"] = task
     _pending[key] = pending
-    asyncio.create_task(_flush_pending(key))
+    return task
 
 
-async def _flush_pending(key: tuple[str, str]) -> None:
+async def _flush_pending(key: tuple[str, str]) -> bool:
     pending = _pending.get(key)
     if pending is None:
-        return
+        return True
     event = pending["non_image_arrived"]
     while True:
         try:
@@ -556,7 +664,7 @@ async def _flush_pending(key: tuple[str, str]) -> None:
         except asyncio.TimeoutError:
             pending = _pending.get(key)
             if pending is None:
-                return
+                return True
             if time.monotonic() - pending["last_arrival_at"] < _MESSAGE_DEBOUNCE_S:
                 continue  # more images still arriving, keep waiting
             break  # true quiet window — flush what we have
@@ -564,44 +672,59 @@ async def _flush_pending(key: tuple[str, str]) -> None:
     _pending.pop(key, None)
     async with _cc_lock:
         try:
-            await _process_combined_msgs(
+            return await _process_combined_msgs(
                 pending["client"], pending["msgs"], pending["account_id"],
             )
         except Exception:
             log.exception("combined msg processing crashed")
+            return False
 
 
 async def _process_combined_msgs(
     client: WeixinClient, msgs: list[dict[str, Any]], account_id: str
-) -> None:
+) -> bool:
     if not msgs:
-        return
+        return True
 
     from_user = msgs[0].get("from_user_id") or ""
     ctx_token = next(
         (m.get("context_token") for m in reversed(msgs) if m.get("context_token")),
         None,
     )
-    items = [item for m in msgs for item in (m.get("item_list") or [])]
-
-    # Decode all items (across the whole burst)
-    texts: list[str] = []
     images: list[dict[str, str]] = []
-    ref_note = ""
-    for item in items:
-        if item.get("ref_msg"):
-            ref_note = _describe_ref(item.get("ref_msg"))
-        text, imgs = await _decode_item(client, item)
-        if text:
-            texts.append(text)
-        images.extend(imgs)
+    message_bodies: list[str] = []
+    for msg in msgs:
+        texts: list[str] = []
+        ref_note = ""
+        for item in msg.get("item_list") or []:
+            if item.get("ref_msg"):
+                ref_note = _describe_ref(item.get("ref_msg"))
+            text, imgs = await _decode_item(client, item)
+            if text:
+                texts.append(text)
+            images.extend(imgs)
+        body = "\n".join(t for t in texts if t).strip()
+        if ref_note:
+            body = f"{ref_note}\n{body}" if body else ref_note
+        if body:
+            message_bodies.append(body)
 
-    combined = "\n".join(t for t in texts if t).strip()
-    if ref_note:
-        combined = f"{ref_note}\n{combined}" if combined else ref_note
+    combined = "\n".join(message_bodies).strip()
+    if len(message_bodies) > 1:
+        blocks = [
+            "The user sent these WeChat messages while the previous turn was "
+            "running or before the current poll checkpoint advanced.",
+            "Treat them as one user turn, ordered oldest to newest. Later "
+            "messages may clarify or supersede earlier messages.",
+            "",
+        ]
+        for idx, body in enumerate(message_bodies, start=1):
+            blocks.append(f"<user_message n={idx}>\n{body}\n</user_message>")
+            blocks.append("")
+        combined = "\n".join(blocks).strip()
     if not combined and not images:
         log.info("inbound from %s: no decodable content", from_user)
-        return
+        return True
 
     log.info("← %s: %s (imgs=%d, msgs=%d)", from_user, combined[:80], len(images), len(msgs))
 
@@ -632,14 +755,15 @@ async def _process_combined_msgs(
     sent_any = False
     had_send_failure = False
 
-    async def _send_bubble(text: str) -> None:
+    async def _send_bubble(text: str) -> bool:
         """Strip markdown (env-gated) + 4000-char hard-cap chunk + send.
         Retries once on transient failure; permanent failure flips
         had_send_failure so turn-end can rebroadcast resp.content."""
         nonlocal sent_any, had_send_failure
         text = strip_markdown(text)
         if not text:
-            return
+            return True
+        ok = True
         for chunk in chunk_text(text):
             success = False
             for attempt in range(2):
@@ -658,6 +782,8 @@ async def _process_combined_msgs(
                         log.error("wx send failed (gave up)", exc_info=True)
             if not success:
                 had_send_failure = True
+                ok = False
+        return ok
 
     async def _drain(allow_hard_cut: bool) -> None:
         """Drain buf. Always ships any complete \\n\\n\\n-bounded bubbles.
@@ -719,19 +845,33 @@ async def _process_combined_msgs(
         elif time.monotonic() - last_flush >= _STREAM_FLUSH_IDLE_S:
             await _drain(allow_hard_cut=False)
 
-    try:
-        resp = await cc.query(
-            combined or "[图片]", images=images or None, on_stream=_on_stream,
-        )
-    except Exception as e:
-        log.exception("CC query failed")
-        try:
-            await client.send_message(
-                from_user, [text_item(f"❌ 处理失败: {e}")], context_token=ctx_token,
+    resp = None
+    for attempt in range(_WX_MAX_TURN_RECOVERY_ATTEMPTS + 1):
+        if attempt:
+            buf.clear()
+            last_flush = None
+            sent_any = False
+            had_send_failure = False
+            log.warning(
+                "Replaying WeChat turn after CC query failure "
+                "(attempt %d/%d)",
+                attempt,
+                _WX_MAX_TURN_RECOVERY_ATTEMPTS,
             )
-        except Exception:
-            pass
-        return
+        try:
+            resp = await cc.query(
+                combined or "[图片]", images=images or None, on_stream=_on_stream,
+            )
+            break
+        except Exception as e:
+            log.exception("CC query failed")
+            if attempt < _WX_MAX_TURN_RECOVERY_ATTEMPTS:
+                await asyncio.sleep(0)
+                continue
+            log.error("WeChat turn remains unconsumed after retries: %s", e)
+            return False
+    if resp is None:
+        return False
 
     # End-of-stream drain — allow_hard_cut=True ships everything still in
     # buf even if no safe boundary exists (rare: nothing more is coming).
@@ -746,8 +886,11 @@ async def _process_combined_msgs(
     if had_send_failure or not sent_any:
         final = resp.content or ""
         if final:
+            had_send_failure = False
             for part in re.split(r"\n{3,}", final):
                 await _send_bubble(part)
+        elif had_send_failure:
+            return False
 
     if resp.resume_note:
         try:
@@ -762,6 +905,83 @@ async def _process_combined_msgs(
             await client.send_typing(from_user, ticket, 2)
         except Exception:
             pass
+
+    return not had_send_failure
+
+
+def _coalesce_update_msgs(msgs: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    units: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    current_from = None
+    for msg in msgs:
+        if msg.get("message_type") != 1:  # USER only (ignore BOT echoes)
+            continue
+        from_user = msg.get("from_user_id") or ""
+        if current and from_user != current_from:
+            units.append(current)
+            current = []
+        current.append(msg)
+        current_from = from_user
+    if current:
+        units.append(current)
+    return units
+
+
+async def _process_wx_units(
+    client: WeixinClient,
+    account_id: str,
+    units: list[list[dict[str, Any]]],
+) -> bool:
+    batch_ok = True
+    processing_tasks: list[asyncio.Task] = []
+    for msg_unit in units:
+        try:
+            if len(msg_unit) == 1:
+                result = await _enqueue_inbound_msg(client, msg_unit[0], account_id)
+            else:
+                result = await _enqueue_inbound_msgs(client, msg_unit, account_id)
+            if isinstance(result, asyncio.Task):
+                processing_tasks.append(result)
+            elif result is False:
+                batch_ok = False
+        except Exception:
+            batch_ok = False
+            log.exception("msg enqueue crashed")
+    if processing_tasks:
+        unique_tasks = list(dict.fromkeys(processing_tasks))
+        results = await asyncio.gather(*unique_tasks, return_exceptions=True)
+        for result in results:
+            if result is False or isinstance(result, Exception):
+                batch_ok = False
+                if isinstance(result, Exception):
+                    log.warning("async wx processing failed: %s", result)
+    return batch_ok
+
+
+async def _replay_pending_wx_updates(
+    client: WeixinClient,
+    account_id: str,
+) -> None:
+    for record in await _pending_wx_batches_for_account(account_id):
+        record_id = str(record.get("id") or "")
+        new_buf = str(record.get("new_buf") or "")
+        units = record.get("units")
+        if not record_id or not isinstance(units, list):
+            log.warning("dropping malformed wx pending record: %s", record_id or "?")
+            if record_id:
+                await _ack_pending_wx_batch(record_id)
+            continue
+        if new_buf and load_sync_buf(account_id) == new_buf:
+            await _ack_pending_wx_batch(record_id)
+            continue
+        ok = await _process_wx_units(client, account_id, units)
+        if not ok:
+            log.warning("wx pending replay still unconsumed: %s", record_id)
+            break
+        if new_buf:
+            save_sync_buf(account_id, new_buf)
+        await _ack_pending_wx_batch(record_id)
+        log.warning("replayed unconsumed WX update batch: %s", record_id)
 
 
 # ── login ────────────────────────────────────────────────────────────
@@ -831,6 +1051,7 @@ async def _run_account(account_id: str) -> None:
 
     asyncio.create_task(_heartbeat_loop(client, account_id))
 
+    await _replay_pending_wx_updates(client, account_id)
     buf = load_sync_buf(account_id)
     fails = 0
 
@@ -853,17 +1074,26 @@ async def _run_account(account_id: str) -> None:
 
         fails = 0
         new_buf = resp.get("get_updates_buf", buf)
-        if new_buf != buf:
-            buf = new_buf
-            save_sync_buf(account_id, buf)
-
-        for m in resp.get("msgs") or []:
-            if m.get("message_type") != 1:  # USER only (ignore BOT echoes)
-                continue
+        units = _coalesce_update_msgs(resp.get("msgs") or [])
+        pending_record_id = ""
+        batch_ok = True
+        if units:
             try:
-                await _enqueue_inbound_msg(client, m, account_id)
+                pending_record_id = await _record_pending_wx_batch(
+                    account_id,
+                    new_buf=new_buf,
+                    units=units,
+                )
             except Exception:
-                log.exception("msg enqueue crashed")
+                batch_ok = False
+                log.exception("wx pending-updates write failed")
+            if batch_ok:
+                batch_ok = await _process_wx_units(client, account_id, units)
+        if batch_ok and new_buf != buf:
+            save_sync_buf(account_id, new_buf)
+            buf = new_buf
+        if batch_ok and pending_record_id:
+            await _ack_pending_wx_batch(pending_record_id)
 
 
 # Distinguishes two exit-0 paths so launchd KeepAlive { SuccessfulExit: false }

@@ -23,6 +23,11 @@ class FakeStream:
             raise StopAsyncIteration
         return self._lines.pop(0)
 
+    async def readline(self):
+        if not self._lines:
+            return b""
+        return self._lines.pop(0)
+
     async def read(self):
         return self._body
 
@@ -34,6 +39,15 @@ class RaisingStream(FakeStream):
 
     async def __anext__(self):
         raise self._exc
+
+    async def readline(self):
+        raise self._exc
+
+
+class HangingStream(FakeStream):
+    async def readline(self):
+        await asyncio.sleep(3600)
+        return b""
 
 
 class FakeProcess:
@@ -106,7 +120,8 @@ def test_codex_engine_query_parses_json_and_persists(monkeypatch, tmp_path):
         assert resp.output_tokens == 2
         assert streamed == [("/bin/zsh", None), (None, "OK")]
         assert "mcp_servers.tg" in " ".join(captured["cmd"])
-        assert captured["kwargs"]["stdin"] is codex_engine.asyncio.subprocess.DEVNULL
+        assert captured["cmd"][-1] == "-"
+        assert captured["kwargs"]["stdin"] is codex_engine.asyncio.subprocess.PIPE
         assert captured["kwargs"]["limit"] == codex_engine._CODEX_STREAM_LIMIT
         state = json.loads((tmp_path / "session.json").read_text())
         assert state["session_id"] == "sid-1"
@@ -114,6 +129,54 @@ def test_codex_engine_query_parses_json_and_persists(monkeypatch, tmp_path):
         assert state["codex_sessions"]["sid-1"]["turns"][-2:] == [["user", "hello"], ["assistant", "OK"]]
 
     asyncio.run(run())
+
+
+def test_codex_engine_injects_babata_memory_once_per_session(monkeypatch, tmp_path):
+    monkeypatch.setenv("BABATA_CODEX_MEMORY_INJECT", "1")
+    seen_sources: list[str | None] = []
+    monkeypatch.setattr(
+        codex_engine,
+        "_render_babata_memory_context_event",
+        lambda source=None, user_prompt=None: (
+            seen_sources.append(source) or "<memory-context>shared</memory-context>",
+            None,
+        ),
+    )
+    reflex_sources: list[str | None] = []
+    monkeypatch.setattr(
+        codex_engine,
+        "_log_memory_reflex_preflight_only",
+        lambda source=None, user_prompt=None: reflex_sources.append(source) or "event-1",
+    )
+    session = codex_engine.CodexEngine(
+        state_file=tmp_path / "session.json",
+        source_prompt="Source: test.",
+    )
+
+    cmd, prompt_stdin, memory_injected = session._build_command("hello", [], tmp_path / "last.txt")
+
+    assert cmd[-1] == "-"
+    assert memory_injected is True
+    assert seen_sources == ["unknown"]
+    assert "Source: test." in prompt_stdin
+    assert "<memory-context>shared</memory-context>" in prompt_stdin
+    assert prompt_stdin.endswith("hello")
+
+    session._mark_codex_memory_injected("sid-1")
+    session._session_id = "sid-1"
+    _cmd, resumed_prompt, resumed_injected = session._build_command("again", [], tmp_path / "last.txt")
+
+    assert resumed_injected is False
+    assert "<memory-context>shared</memory-context>" not in resumed_prompt
+    assert resumed_prompt.endswith("again")
+    assert reflex_sources == ["unknown"]
+
+
+def test_codex_engine_maps_channel_prompt_to_memory_source():
+    assert codex_engine._memory_source_from_prompt("Source: Telegram. x") == "tg"
+    assert codex_engine._memory_source_from_prompt("Source: WeChat. x") == "wechat"
+    assert codex_engine._memory_source_from_prompt("Source: Sidebar. x") == "sidebar"
+    assert codex_engine._memory_source_from_prompt("Source: test. x") == "unknown"
 
 
 def test_codex_engine_streams_tool_results(monkeypatch, tmp_path):
@@ -187,6 +250,33 @@ def test_codex_engine_handles_stdout_reader_splitter_failure(monkeypatch, tmp_pa
         resp = await session.query("hello")
 
         assert "long-output splitter limit" in resp.content
+        assert proc.terminated is True
+
+    asyncio.run(run())
+
+
+def test_codex_engine_stall_timeout_terminates_process(monkeypatch, tmp_path):
+    proc = FakeProcess([])
+    proc.stdout = HangingStream()
+
+    async def fake_create(*_cmd, **_kwargs):
+        return proc
+
+    async def run():
+        monkeypatch.setenv("BABATA_CODEX_STALL_TIMEOUT", "0.01")
+        monkeypatch.setattr(codex_engine.asyncio, "create_subprocess_exec", fake_create)
+        session = codex_engine.CodexEngine(
+            state_file=tmp_path / "session.json",
+            source_prompt="Source: test.",
+        )
+
+        try:
+            await session.query("hello")
+        except RuntimeError as e:
+            assert "codex stalled" in str(e)
+        else:
+            raise AssertionError("expected codex stall timeout")
+
         assert proc.terminated is True
 
     asyncio.run(run())

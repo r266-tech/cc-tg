@@ -6,6 +6,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _disable_codex_memory_inject_by_default(monkeypatch):
+    monkeypatch.setenv("BABATA_CODEX_MEMORY_INJECT", "0")
+    monkeypatch.setenv("BABATA_CC_MEMORY_INJECT", "0")
+
 
 @dataclass
 class ClaudeAgentOptions:

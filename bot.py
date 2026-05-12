@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from dotenv import load_dotenv
@@ -73,11 +74,15 @@ log = logging.getLogger(PROJECT)
 _TG_MCP_SCRIPT = str(Path(__file__).parent / "tg_mcp.py")
 
 # ── Idempotency: TG update_id 持久化 (无感重启) ────────────────────────
-# drop_pending_updates=False → TG 重交付未 ack 的 update; 入口 _processed_set
-# 命中跳过 (不重做); turn 完整结束 (jsonl ResultMessage 收尾) 后落盘标 done.
+# Every decoded user update is first written to pending-updates. Only after a
+# final model response has been delivered do we move update_id to processed and
+# remove it from pending. On restart, pending-updates is replayed before normal
+# polling so a fetched-but-unfinished TG update is not lost.
+# drop_pending_updates=False still helps when Telegram itself can redeliver.
 # 边界 case: turn 完成但落盘前崩溃 → 重启重做 turn + 重发 reply (毫秒窗口,
 # 物理无解, V "做到物理极限就行").
 PROCESSED_UPDATES_FILE = STATE_DIR / f"processed-updates-{INSTANCE}.json"
+PENDING_UPDATES_FILE = STATE_DIR / f"pending-updates-{INSTANCE}.json"
 _PROCESSED_MAX = 1000  # 滚动窗口
 
 def _load_processed() -> set[int]:
@@ -93,11 +98,103 @@ def _load_processed() -> set[int]:
 _processed_lock = asyncio.Lock()
 _processed_set: set[int] = _load_processed()  # 模块加载即填充 (sync read)
 
+def _load_pending_updates() -> dict[str, dict[str, Any]]:
+    if not PENDING_UPDATES_FILE.exists():
+        return {}
+    try:
+        data = json.loads(PENDING_UPDATES_FILE.read_text())
+        records = data.get("pending", {})
+        if isinstance(records, dict):
+            return {str(k): v for k, v in records.items() if isinstance(v, dict)}
+        if isinstance(records, list):
+            return {
+                str(item["update_id"]): item
+                for item in records
+                if isinstance(item, dict) and item.get("update_id") is not None
+            }
+    except Exception as e:
+        log.warning("pending-updates load failed: %s, treating as empty", e)
+    return {}
+
+
+_pending_updates_lock = asyncio.Lock()
+_pending_update_records: dict[str, dict[str, Any]] = _load_pending_updates()
+
+
+def _write_pending_updates_locked() -> None:
+    tmp = PENDING_UPDATES_FILE.with_suffix(".json.partial")
+    PENDING_UPDATES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp.write_text(
+        json.dumps(
+            {"pending": _pending_update_records},
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    os.replace(tmp, PENDING_UPDATES_FILE)
+
+
+async def _ack_pending_update(update_id: int | None) -> None:
+    if update_id is None:
+        return
+    key = str(update_id)
+    async with _pending_updates_lock:
+        if key not in _pending_update_records:
+            return
+        _pending_update_records.pop(key, None)
+        try:
+            _write_pending_updates_locked()
+        except Exception as e:
+            log.warning("pending-updates ack failed: %s", e)
+
+
+async def _pending_update_exists(update_id: int | None) -> bool:
+    if update_id is None:
+        return False
+    async with _pending_updates_lock:
+        return str(update_id) in _pending_update_records
+
+
+async def _record_pending_payload(payload: "Payload") -> None:
+    update_id = payload.update_id
+    if update_id is None:
+        return
+    chat = payload.update.effective_chat
+    msg = payload.update.effective_message
+    if chat is None or msg is None:
+        return
+    record = {
+        "update_id": update_id,
+        "chat_id": chat.id,
+        "message_id": msg.message_id,
+        "text": payload.text,
+        "images": payload.images or [],
+        "received_at": time.time(),
+    }
+    async with _pending_updates_lock:
+        _pending_update_records[str(update_id)] = record
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                _write_pending_updates_locked()
+                return
+            except Exception as e:
+                last_exc = e
+                log.warning(
+                    "pending-updates write failed (attempt %d/3): %s",
+                    attempt + 1,
+                    e,
+                )
+                await asyncio.sleep(0.1)
+        raise RuntimeError(f"pending-updates write failed: {last_exc}")
+
 async def _mark_processed(update_id: int | None) -> None:
     if update_id is None:
         return
     async with _processed_lock:
         if update_id in _processed_set:
+            await _ack_pending_update(update_id)
             return
         _processed_set.add(update_id)
         if len(_processed_set) > _PROCESSED_MAX:
@@ -111,6 +208,8 @@ async def _mark_processed(update_id: int | None) -> None:
             os.replace(tmp, PROCESSED_UPDATES_FILE)
         except Exception as e:
             log.warning("processed-updates write failed: %s", e)
+            return
+    await _ack_pending_update(update_id)
 
 
 _TG_SOURCE_PROMPT = (
@@ -165,6 +264,8 @@ def _bot_commands_for_cpu(cpu: str | None = None) -> list[tuple[str, str]]:
         commands.insert(3, ("context", "Context usage breakdown"))
         commands.insert(6, ("stop", "Interrupt current turn"))
         commands.append(("provider", "切换 Anthropic 渠道"))
+    else:  # codex — cmd_provider line 3075 分支切 codex_accounts
+        commands.append(("provider", "切换 Codex 账号"))
     return commands
 
 
@@ -409,6 +510,11 @@ _MAX_EDIT_INTERVAL = 10.0
 # here. After N consecutive flood failures we stop trying to edit and let
 # turn-end's `_deliver_response` send the rest as a fresh reply_text.
 _MAX_FLOOD_STRIKES = 3
+# A broken CPU stream is recoverable: reconnect the CPU and replay the active
+# V message before continuing later cut-ins. After this many immediate retries,
+# the turn remains unconsumed and queued, but later retries are logged as a
+# persistent fault instead of being treated as a consumed user update.
+_MAX_TURN_RECOVERY_ATTEMPTS = int(os.environ.get("BABATA_TURN_RECOVERY_ATTEMPTS", "2"))
 
 _TOOL_EMOJI = {
     "Bash": "\U0001f4bb",           # 💻 terminal
@@ -772,6 +878,104 @@ class Payload:
     update_id: int | None = None  # idempotency: turn end 时 _mark_processed
 
 
+def _format_coalesced_tg_prompt(payloads: list[Payload]) -> str:
+    if len(payloads) <= 1:
+        return payloads[0].text if payloads else ""
+
+    blocks = [
+        "The user sent these follow-up Telegram messages while the previous "
+        "turn was running.",
+        "Treat them as one user turn, ordered oldest to newest. Later messages "
+        "may clarify or supersede earlier messages.",
+        "",
+    ]
+    for idx, payload in enumerate(payloads, start=1):
+        msg = payload.update.effective_message
+        meta = [f"n={idx}"]
+        if payload.update_id is not None:
+            meta.append(f"update_id={payload.update_id}")
+        if msg is not None and getattr(msg, "message_id", None) is not None:
+            meta.append(f"message_id={msg.message_id}")
+        if payload.images:
+            meta.append(f"images={len(payload.images)}")
+        text = payload.text.strip() or "[empty message]"
+        blocks.append(f"<user_message {' '.join(meta)}>\n{text}\n</user_message>")
+        blocks.append("")
+    return "\n".join(blocks).strip()
+
+
+class _ReplayChat:
+    def __init__(self, bot_obj: Any, chat_id: int) -> None:
+        self._bot = bot_obj
+        self.id = chat_id
+
+    async def send_action(self, action: str) -> None:
+        await self._bot.send_chat_action(chat_id=self.id, action=action)
+
+
+class _ReplayMessage:
+    def __init__(self, bot_obj: Any, chat_id: int, message_id: int) -> None:
+        self._bot = bot_obj
+        self.chat_id = chat_id
+        self.message_id = message_id
+        self.text = None
+        self.caption = None
+        self.reply_to_message = None
+        self.document = None
+        self.photo = None
+        self.voice = None
+        self.audio = None
+
+    async def reply_text(self, text: str, parse_mode=None, reply_markup=None):
+        kwargs: dict[str, Any] = {
+            "chat_id": self.chat_id,
+            "text": text,
+            "reply_to_message_id": self.message_id,
+        }
+        if parse_mode:
+            kwargs["parse_mode"] = parse_mode
+        if reply_markup is not None:
+            kwargs["reply_markup"] = reply_markup
+        return await self._bot.send_message(**kwargs)
+
+
+class _ReplayUpdate:
+    def __init__(
+        self,
+        *,
+        update_id: int,
+        bot_obj: Any,
+        chat_id: int,
+        message_id: int,
+    ) -> None:
+        self.update_id = update_id
+        self.effective_chat = _ReplayChat(bot_obj, chat_id)
+        self.effective_message = _ReplayMessage(bot_obj, chat_id, message_id)
+        self.message = self.effective_message
+        self.effective_user = None
+
+
+def _payload_from_pending_record(bot_obj: Any, record: dict[str, Any]) -> Payload | None:
+    try:
+        update_id = int(record["update_id"])
+        chat_id = int(record["chat_id"])
+        message_id = int(record["message_id"])
+        text = str(record["text"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    images = record.get("images") or None
+    if images is not None and not isinstance(images, list):
+        images = None
+    update = _ReplayUpdate(
+        update_id=update_id,
+        bot_obj=bot_obj,
+        chat_id=chat_id,
+        message_id=message_id,
+    )
+    ctx = SimpleNamespace(bot=bot_obj, application=None)
+    return Payload(update=update, ctx=ctx, text=text, images=images, update_id=update_id)
+
+
 class ChannelWorker:
     """Per-process TG channel worker for one long-lived LiveSession."""
 
@@ -835,10 +1039,15 @@ class ChannelWorker:
         # 一条的 reply 上 (即使 SDK 把多条 batch 成一个 turn 也能保持 per-message
         # reply 体验).
         self._active_reply_payload: Payload | None = None
+        self._turn_payload_batch: list[Payload] = []
         # Cut-in 队列 (interrupt 模式): V 流式中再发 → SDK interrupt + append 到这.
         # _handle_turn_end 末尾 pop 出来 _begin_turn 启动新 turn. submit() 不再
         # 改 anchor 状态 (留给老 turn 自然收尾), V 看到的 in-flight 气泡保留.
         self._pending_payloads: list[Payload] = []
+        # Recoverable CPU stream failures replay the active payload before
+        # continuing pending cut-ins. This counter is per active user turn and
+        # resets on a successful turn_end or explicit reset/resume.
+        self._turn_recovery_attempts = 0
         # Codex round-2 P0: turn epoch token. _begin_turn / _reset_turn_state
         # 每次 bump. _spawn_interrupt capture 当时 epoch, 实际 fire interrupt 前
         # check epoch 没变才继续 — 防 fire-and-forget interrupt 因 race 打断错的
@@ -876,7 +1085,7 @@ class ChannelWorker:
             except (asyncio.TimeoutError, Exception):
                 pass
 
-    async def submit(self, payload: Payload) -> None:
+    async def submit(self, payload: Payload, *, interrupt_active: bool = True) -> None:
         chat = payload.update.effective_chat
         msg = payload.update.effective_message
         if chat is None or msg is None:
@@ -890,6 +1099,7 @@ class ChannelWorker:
         async with self._state_lock:
             if payload.text.strip() == "/new" and not payload.images:
                 await self._handle_reset(payload)
+                await _mark_processed(payload.update_id)
                 return
 
             # P1.4: always update latest_payload so a mid-turn submit (which
@@ -912,11 +1122,26 @@ class ChannelWorker:
                 # 模式卡死 (m1+m2 合并 ResultMessage 但我们 promote m2 等不到第二
                 # turn_end). codex R3 P0 验证.
                 self._pending_payloads.append(payload)
-                self._spawn_interrupt()
+                if self._turn_active and interrupt_active:
+                    self._spawn_interrupt()
             else:
                 self._active_reply_payload = payload
-                self._begin_turn(payload)
+                self._begin_turn(payload, batch_payloads=[payload])
                 await self._submit_to_session(payload)
+
+    async def has_update_id(self, update_id: int | None) -> bool:
+        if update_id is None:
+            return False
+        async with self._state_lock:
+            known = [
+                getattr(self._turn_payload, "update_id", None),
+                getattr(self._active_reply_payload, "update_id", None),
+                getattr(self._latest_payload, "update_id", None),
+            ]
+            known.extend(p.update_id for p in self._pending_payloads)
+            known.extend(self._active_update_ids)
+            known.extend(self._pending_update_ids)
+            return update_id in known
 
     async def interrupt(self) -> None:
         await self.session.interrupt()
@@ -932,6 +1157,7 @@ class ChannelWorker:
             self._reset_turn_state(
                 exit_inflight=True, drop_pending=True, fail_emoji="💔"
             )
+            self._turn_recovery_attempts = 0
             return await self.session.resume_live(sid)
 
     async def _handle_reset(self, payload: Payload) -> None:
@@ -942,14 +1168,60 @@ class ChannelWorker:
         self._reset_turn_state(
             exit_inflight=True, drop_pending=True, fail_emoji="💔"
         )
+        self._turn_recovery_attempts = 0
         resp = await self.session.reset_live()
         await self._deliver_response(payload, resp)
         self._apply_accounting(resp)
 
-    def _begin_turn(self, payload: Payload) -> None:
+    def _session_supports_hot_input(self) -> bool:
+        return bool(getattr(self.session, "supports_hot_input", True))
+
+    def _coalesce_payloads_for_turn(self, payloads: list[Payload]) -> Payload:
+        if len(payloads) <= 1:
+            return payloads[0]
+        anchor = payloads[-1]
+        images: list[dict[str, str]] = []
+        for payload in payloads:
+            images.extend(payload.images or [])
+        return Payload(
+            update=anchor.update,
+            ctx=anchor.ctx,
+            text=_format_coalesced_tg_prompt(payloads),
+            images=images or None,
+            update_id=None,
+        )
+
+    def _pop_next_pending_turn(self) -> tuple[Payload, list[Payload]] | None:
+        if not self._pending_payloads:
+            return None
+        if self._session_supports_hot_input():
+            payloads = [self._pending_payloads.pop(0)]
+        else:
+            payloads = list(self._pending_payloads)
+            self._pending_payloads = []
+        return self._coalesce_payloads_for_turn(payloads), payloads
+
+    async def _start_next_pending_locked(self) -> None:
+        if self._turn_active:
+            return
+        next_turn = self._pop_next_pending_turn()
+        if next_turn is None:
+            return
+        next_payload, batch_payloads = next_turn
+        self._begin_turn(next_payload, batch_payloads=batch_payloads)
+        await self._submit_to_session(next_payload)
+
+    def _begin_turn(
+        self,
+        payload: Payload,
+        *,
+        batch_payloads: list[Payload] | None = None,
+    ) -> None:
+        batch_payloads = list(batch_payloads or [payload])
         msg = payload.update.effective_message
         self._turn_active = True
         self._turn_payload = payload
+        self._turn_payload_batch = batch_payloads
         self._latest_payload = payload  # keep latest in sync
         # P1-A/B: 切 anchor 时 +1 generation. P1.4 promote 路径走这里, 也要 bump.
         self._anchor_generation += 1
@@ -976,13 +1248,26 @@ class ChannelWorker:
         self._reset_flood_state()
         # 消息状态 promote: pending → active. 👀 已在 submit fire (每条 V msg
         # 立即 ack), 这里只挪账, 不再 fire — 避免重复 setMessageReaction 调用.
-        # Codex round-1 P0: 只 promote 第一个 pending mark/uid 不是全部 — 多
-        # cut-in (m2 + m3 都在 m1 turn 内) 时 _begin_turn(m2) 全 promote 会让
-        # m3 跟 m2 一起被当 turn-end 时 fire 👌, m3 永远不会有自己的 turn 处理.
-        # 单 cut-in 是 1-to-1 不受影响.
-        if self._pending_marks:
-            self._active_marks = [self._pending_marks.pop(0)]
-            self._active_update_ids = [self._pending_update_ids.pop(0)]
+        # Hot-input sessions keep one V message per queued turn. Non-hot
+        # sessions (Codex CLI) may coalesce several pending messages into one
+        # physical model turn; all their marks/uids move together.
+        promote_count = min(
+            len(batch_payloads),
+            len(self._pending_marks),
+            len(self._pending_update_ids),
+        )
+        if promote_count:
+            self._active_marks = self._pending_marks[:promote_count]
+            self._active_update_ids = self._pending_update_ids[:promote_count]
+            del self._pending_marks[:promote_count]
+            del self._pending_update_ids[:promote_count]
+        if promote_count != len(batch_payloads):
+            log.warning(
+                "turn batch/mark mismatch: batch=%d marks=%d uids=%d",
+                len(batch_payloads),
+                len(self._pending_marks),
+                len(self._pending_update_ids),
+            )
         _inflight_enter()
 
     async def _consume_events(self) -> None:
@@ -1018,13 +1303,10 @@ class ChannelWorker:
                 # Make sure turn-bound state doesn't leak across reconnect
                 async with self._state_lock:
                     if self._turn_active:
-                        await self._surface_error(e)
-                        # P2-D: consume crash → reconnect, pending V msgs 失效
-                        # 💔 让 V 一眼看到这些没完成.
+                        self._requeue_active_turn_for_recovery()
                         self._reset_turn_state(
                             exit_inflight=True,
-                            drop_pending=True,
-                            fail_emoji="💔",
+                            mark_processed=False,
                         )
 
             if self._stopping:
@@ -1034,6 +1316,7 @@ class ChannelWorker:
             try:
                 await self.session.connect()
                 backoff = 1.0
+                await self._start_next_pending_after_reconnect()
             except Exception as e:
                 log.warning("LiveSession reconnect failed: %s; retry in %.1fs", e, backoff)
                 await asyncio.sleep(backoff)
@@ -1421,6 +1704,7 @@ class ChannelWorker:
                         resp.cost,
                         resp.session_id[:8] if resp.session_id else "new",
                     )
+                self._turn_recovery_attempts = 0
             finally:
                 # 只 fire 👌 给 _active_marks (= 当前 turn 的 V msgs). _pending_marks
                 # 是 cut-in 期间 push 的 (= 下一 turn 的 V msgs), 留着等 _begin_turn
@@ -1448,25 +1732,90 @@ class ChannelWorker:
                 # 设新 anchor + bump gen + epoch. 然后 _submit_to_session 才把
                 # B 推入 SDK inbox — cut-in 时不 submit, 这里才 submit, 防 stale
                 # interrupt + SDK batch 卡死.
-                next_payload = (
-                    self._pending_payloads.pop(0) if self._pending_payloads else None
-                )
-                if next_payload is not None:
-                    self._begin_turn(next_payload)
-                    await self._submit_to_session(next_payload)
+                if self._pending_payloads:
+                    await self._start_next_pending_locked()
 
     async def _handle_error(self, exc: Exception) -> None:
         log.error("CC stream failed: %s", exc)
         async with self._state_lock:
+            replaying = False
+            if self._turn_recovery_attempts < _MAX_TURN_RECOVERY_ATTEMPTS:
+                replaying = self._requeue_active_turn_for_recovery()
+                if replaying:
+                    self._turn_recovery_attempts += 1
+                    log.warning(
+                        "Replaying active turn after stream error "
+                        "(attempt %d/%d); pending=%d",
+                        self._turn_recovery_attempts,
+                        _MAX_TURN_RECOVERY_ATTEMPTS,
+                        len(self._pending_payloads),
+                    )
+                    # The active/pending TG updates are still live work. Do not
+                    # mark them processed and do not mark reactions failed; after
+                    # reconnect, _start_next_pending_after_reconnect() will replay
+                    # N and then continue N+1...
+                    self._reset_turn_state(
+                        exit_inflight=True,
+                        mark_processed=False,
+                    )
+            if replaying:
+                return
+
+            # Still no final response after bounded live retries. This is not
+            # consumed: keep N at the front, keep N+1... behind it, and let the
+            # reconnect supervisor try again after the underlying fault clears.
+            if self._requeue_active_turn_for_recovery():
+                log.error(
+                    "Active TG turn remains unconsumed after %d recovery attempts; "
+                    "will retry after reconnect",
+                    self._turn_recovery_attempts,
+                )
+                self._reset_turn_state(exit_inflight=True, mark_processed=False)
+                return
+
             await self._surface_error(exc)
-            # P2-D: stream error → LiveSession 已 _mark_dead_after_error 清 inbox,
-            # pending marks 永远不会被处理. ChannelWorker supervisor reconnect
-            # 后 _begin_turn 不能 promote 这些已废弃 mark.
-            # 💔 让 V 看到这些 V msg 因 error 中止 (跟 _surface_error 的 "Error:"
-            # message 互补 — message 给具体原因, reaction 给状态).
             self._reset_turn_state(
-                exit_inflight=True, drop_pending=True, fail_emoji="💔"
+                exit_inflight=True,
+                drop_pending=False,
+                fail_emoji="💔",
+                mark_processed=False,
             )
+
+    async def _start_next_pending_after_reconnect(self) -> None:
+        """After a supervised reconnect, resume the queued FIFO work.
+
+        This is the recovery actuator for a broken CPU stream: _handle_error()
+        puts the active V message back at the front of _pending_payloads, then
+        the supervisor reconnects the physical session and calls here.
+        """
+        async with self._state_lock:
+            if self._turn_active or not self._pending_payloads:
+                return
+            await self._start_next_pending_locked()
+
+    def _requeue_active_turn_for_recovery(self) -> bool:
+        """Put the active V message back before pending cut-ins.
+
+        Returns False when there is no reliable active payload anchor. Must be
+        called with _state_lock held.
+        """
+        payloads = list(self._turn_payload_batch)
+        if not payloads:
+            payload = self._turn_payload or self._active_reply_payload
+            payloads = [payload] if payload is not None else []
+        if not payloads:
+            return False
+        self._pending_payloads = payloads + self._pending_payloads
+        if self._active_marks:
+            self._pending_marks = list(self._active_marks) + self._pending_marks
+        if self._active_update_ids:
+            self._pending_update_ids = (
+                list(self._active_update_ids) + self._pending_update_ids
+            )
+        for orphan in (self._text_message, self._tool_status):
+            if orphan is not None:
+                self._stale_text_messages.append(orphan)
+        return True
 
     async def _surface_error(self, exc: Exception) -> None:
         text = f"Error: {exc}"
@@ -1626,10 +1975,12 @@ class ChannelWorker:
         exit_inflight: bool,
         drop_pending: bool = False,
         fail_emoji: str | None = None,
+        mark_processed: bool = True,
     ) -> None:
         was_active = self._turn_active
         self._turn_active = False
         self._turn_payload = None
+        self._turn_payload_batch = []
         self._turn_anchor = None
         if self._stale_text_messages:
             self._spawn_orphan_cleanup(self._stale_text_messages)
@@ -1658,16 +2009,15 @@ class ChannelWorker:
         # Codex round-2 P1: bump turn_epoch 让 in-flight interrupt task 看到 stale
         # (reset/error 路径 client 可能已 dead, 老 interrupt 命中重置后的 client 危险).
         self._turn_epoch += 1
-        # P2-D: reset/error/resume 路径要清 _pending_marks (这些 mark 的 V 消息
-        # 永远不会被处理了 — /new 后 inbox 已 drain). turn_end 路径不清, 留给
-        # P1.4 promote 给下个 SDK turn 用.
-        # idempotency: error/resume reset 把 V 已收到 💔 的 update 标 done,
-        # 重启 TG 重交付时跳过 (V 不会看到重做的 reply, V "不要重做"). _active
-        # 也一起标 — 这条 turn 已被 abort, V 已知失败, 重启不该再跑.
-        self._schedule_mark_processed(self._active_update_ids)
+        # P2-D: reset/resume 可以显式丢弃 pending；transport/CPU 故障路径必须
+        # pass mark_processed=False, 因为没有最终回复就不算 consumed.
+        # turn_end 路径不清 pending marks, 留给 P1.4 promote 给下个 SDK turn 用.
+        if mark_processed:
+            self._schedule_mark_processed(self._active_update_ids)
         self._active_update_ids = []
         if drop_pending:
-            self._schedule_mark_processed(self._pending_update_ids)
+            if mark_processed:
+                self._schedule_mark_processed(self._pending_update_ids)
             self._pending_update_ids = []
             self._pending_marks = []
             self._pending_payloads = []
@@ -1683,8 +2033,8 @@ class ChannelWorker:
         task.add_done_callback(self._reaction_tasks.discard)
 
     def _schedule_mark_processed(self, uids: list[int | None]) -> None:
-        """Fire-and-forget mark processed: sync-callable, async 落盘. 用于 reset
-        路径 (sync function 不能 await), 或 error/💔 路径 V 已知失败不重做."""
+        """Fire-and-forget mark processed: sync-callable async persistence for
+        explicit abort paths such as /new or /resume."""
         valid = [u for u in uids if u is not None]
         if not valid:
             return
@@ -1709,11 +2059,11 @@ class ChannelWorker:
             await self.session.connect()
             self.session.submit(payload.text, payload.images)
         except Exception as e:
-            log.error("Second submit failed: %s — dropping V message", e)
+            log.error("Second submit failed: %s — keeping V message pending", e)
+            self._requeue_active_turn_for_recovery()
             self._reset_turn_state(
                 exit_inflight=True,
-                drop_pending=True,
-                fail_emoji="💔",
+                mark_processed=False,
             )
 
     def _spawn_interrupt(self) -> None:
@@ -1789,6 +2139,45 @@ def _worker() -> ChannelWorker:
     if _channel_worker is None:
         raise RuntimeError("ChannelWorker is not started")
     return _channel_worker
+
+
+async def _replay_pending_updates(app: Application) -> None:
+    async with _pending_updates_lock:
+        records = list(_pending_update_records.values())
+    if not records:
+        return
+
+    def _sort_key(record: dict[str, Any]) -> tuple[float, int]:
+        try:
+            received = float(record.get("received_at") or 0)
+        except (TypeError, ValueError):
+            received = 0.0
+        try:
+            update_id = int(record.get("update_id") or 0)
+        except (TypeError, ValueError):
+            update_id = 0
+        return (received, update_id)
+
+    replayed = 0
+    for record in sorted(records, key=_sort_key):
+        try:
+            update_id = int(record.get("update_id"))
+        except (TypeError, ValueError):
+            continue
+        if update_id in _processed_set:
+            await _ack_pending_update(update_id)
+            continue
+        payload = _payload_from_pending_record(app.bot, record)
+        if payload is None:
+            log.warning("pending update record is malformed: update_id=%s", update_id)
+            continue
+        try:
+            await _worker().submit(payload, interrupt_active=False)
+            replayed += 1
+        except Exception as e:
+            log.warning("pending update replay failed: update_id=%s: %s", update_id, e)
+    if replayed:
+        log.warning("replayed %d unconsumed TG update(s) from pending journal", replayed)
 
 
 # ── Handlers ──────────────────────────────────────────────────────────
@@ -2993,6 +3382,25 @@ def _current_provider_label() -> str:
     return data.get("providers", {}).get(key, {}).get("display_name", key)
 
 
+def _codex_choices() -> list[tuple[str, str]]:
+    """[(display_name, slot), ...] for codex accounts. Same dynamic shape as
+    _provider_choices but reads providers.json.codex_accounts."""
+    data = _load_providers()
+    return [(cfg.get("display_name", key), key) for key, cfg in data.get("codex_accounts", {}).items()]
+
+
+def _current_codex_key() -> str:
+    return _load_providers().get("codex_current", "?")
+
+
+def _current_codex_label() -> str:
+    data = _load_providers()
+    key = data.get("codex_current")
+    if not key:
+        return "?"
+    return data.get("codex_accounts", {}).get(key, {}).get("display_name", key)
+
+
 async def _run_cc_router_switch(key: str) -> tuple[int, str]:
     if not _CC_ROUTER_CLI:
         return 2, "/provider 未配置 (需要 BABATA_CC_ROUTER_DIR env)"
@@ -3012,6 +3420,28 @@ async def _run_cc_router_switch(key: str) -> tuple[int, str]:
         return 2, f"/provider 失败: {type(e).__name__}: {e}"
 
 
+async def _run_cc_router_codex(slot: str) -> tuple[int, str]:
+    """Run `cli.py codex <slot>` — swaps ~/.codex/auth.json + Codex.app profile
+    symlinks. Doesn't touch ~/.claude/settings.json and doesn't restart babata
+    (babata fork-execs codex per message; new symlink picked up by next fork)."""
+    if not _CC_ROUTER_CLI:
+        return 2, "/provider 未配置 (需要 BABATA_CC_ROUTER_DIR env)"
+    try:
+        result = await asyncio.to_thread(
+            subprocess.run,
+            [_CC_ROUTER_CLI, "codex", slot],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        body = (result.stdout + result.stderr).strip() or "(no output)"
+        return result.returncode, body
+    except subprocess.TimeoutExpired:
+        return 124, "/provider codex 超时 (15s)"
+    except Exception as e:
+        return 2, f"/provider codex 失败: {type(e).__name__}: {e}"
+
+
 async def cmd_provider(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """切换 Anthropic 渠道.
 
@@ -3026,19 +3456,44 @@ async def cmd_provider(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # Infrastructure-changing command: fail-closed even if ALLOWED_USER==0 (开发态后门).
     if not ALLOWED_USER or not (update.effective_user and update.effective_user.id == ALLOWED_USER):
         return
-    if _current_cpu_name() != "claude":
-        await update.message.reply_text("当前 CPU 是 Codex，/provider 不生效；先 /cpu claude 再切 Anthropic 渠道。")
-        return
 
     args = (update.message.text or "").split(maxsplit=1)
-    if len(args) > 1 and args[1].strip():
-        rc, body = await _run_cc_router_switch(args[1].strip())
+    arg = args[1].strip() if len(args) > 1 else ""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    if _current_cpu_name() == "codex":
+        # codex CPU: 切 codex 账号 (symlink swap, 不重启 babata, 下条 message 生效)
+        if arg:
+            rc, body = await _run_cc_router_codex(arg)
+            prefix = "🔄 Codex 切换中" if rc == 0 and "switched to" in body else f"⚠️ exit={rc}"
+            await update.message.reply_text(f"{prefix}\n```\n{body}\n```", parse_mode="Markdown")
+            return
+        current_key = _current_codex_key()
+        current_label = _current_codex_label()
+        choices = _codex_choices()
+        if not choices:
+            await update.message.reply_text("⚠️ codex_accounts 未配置 (cc-router codex init 没跑过)")
+            return
+        buttons = [
+            [InlineKeyboardButton(
+                f"{'● ' if key == current_key else '○ '}{name}",
+                callback_data=f"codex:{key}",
+            )]
+            for name, key in choices
+        ]
+        buttons.append([InlineKeyboardButton("➕ 添加新账号", callback_data="codex_add:click")])
+        await update.message.reply_text(
+            f"Codex 账号 (当前: {current_label}):",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    # claude CPU: 切 Anthropic 渠道 (改 settings.json + 重启 babata)
+    if arg:
+        rc, body = await _run_cc_router_switch(arg)
         prefix = "🔄 切换中" if rc == 0 and "switched to" in body else f"⚠️ exit={rc}"
         await update.message.reply_text(f"{prefix}\n```\n{body}\n```", parse_mode="Markdown")
         return
-
-    # No arg → inline button UI.
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     current_key = _current_provider_key()
     current_label = _current_provider_label()
     choices = _provider_choices()
@@ -3064,7 +3519,7 @@ async def on_provider_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         return
     await q.answer()
     if _current_cpu_name() != "claude":
-        await q.edit_message_text("当前 CPU 是 Codex，/provider 不生效；先 /cpu claude 再切 Anthropic 渠道。")
+        await q.edit_message_text("CPU 已切到 Codex, Anthropic 渠道按钮失效。重新 /provider 看 codex 账号选项。")
         return
     data = q.data or ""
     if ":" not in data:
@@ -3075,6 +3530,48 @@ async def on_provider_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     rc, body = await _run_cc_router_switch(key)
     prefix = "🔄 切换中" if rc == 0 and "switched to" in body else f"⚠️ exit={rc}"
     await q.edit_message_text(f"{prefix}\n```\n{body}\n```", parse_mode="Markdown")
+
+
+async def on_codex_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not await _callback_allowed(q):
+        return
+    await q.answer()
+    if _current_cpu_name() != "codex":
+        await q.edit_message_text("CPU 已切到 Claude, Codex 账号按钮失效。重新 /provider 看 Anthropic 渠道选项。")
+        return
+    data = q.data or ""
+    if ":" not in data:
+        return
+    _, key = data.split(":", 1)
+    target_name = dict((k, n) for n, k in _codex_choices()).get(key, key)
+    await q.edit_message_text(f"🔄 切换 Codex 到 {target_name}…")
+    rc, body = await _run_cc_router_codex(key)
+    prefix = "🔄 切换中" if rc == 0 and "switched to" in body else f"⚠️ exit={rc}"
+    await q.edit_message_text(f"{prefix}\n```\n{body}\n```", parse_mode="Markdown")
+
+
+async def on_codex_add_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """添加新 Codex 账号 — 显示三步指南。
+    OAuth 必须在浏览器完成, 没法 in-bot 跑; 半自动也只能省第 1 步, 价值不大,
+    保持纯指南最干净。"""
+    q = update.callback_query
+    if not await _callback_allowed(q):
+        return
+    await q.answer()
+    text = (
+        "*添加新 Codex 账号 (3 步)*\n\n"
+        "在 terminal 跑:\n"
+        "```\n"
+        "cc-router codex <slot-name>\n"
+        "codex login\n"
+        "```\n"
+        "1. `<slot-name>` 起个简称 (如 `personal` / `work`), cc-router 会自动创建空 slot 并切过去, 同时 quit + 重开 Codex.app\n"
+        "2. `codex login` 浏览器 OAuth 选目标账号, 写入 `auth.<slot>.json`\n"
+        "3. 在已打开的 Codex.app 里用同一账号登一次 (写入 `Codex.<slot>/`)\n\n"
+        "完成后再点 /provider 应该能看到新 slot ✓ ✓"
+    )
+    await q.edit_message_text(text, parse_mode="Markdown")
 
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3551,13 +4048,20 @@ async def _process(
     images: list[dict[str, str]] | None = None,
 ) -> None:
     """Enqueue user input into the live CC session and return immediately."""
+    update_id = getattr(update, "update_id", None)
     # Idempotency: 重启后 TG 重交付的 update 跳过, V 不会看到重做的 reply.
-    if update.update_id in _processed_set:
-        log.info("idempotent skip: update_id=%s already processed", update.update_id)
+    if update_id in _processed_set:
+        log.info("idempotent skip: update_id=%s already processed", update_id)
         return
+    if await _pending_update_exists(update_id):
+        try:
+            if await _worker().has_update_id(update_id):
+                log.info("idempotent skip: update_id=%s already queued", update_id)
+                return
+        except RuntimeError:
+            pass
     chat = update.effective_chat
     msg = update.effective_message
-    await chat.send_action("typing")
 
     # Physical: reply/quote content isn't in msg.text, must prepend
     reply = getattr(msg, "reply_to_message", None)
@@ -3575,7 +4079,17 @@ async def _process(
         text = f"[Replying to]: {quoted}\n\n{text}"
 
     try:
-        await _worker().submit(Payload(update=update, ctx=ctx, text=text, images=images, update_id=update.update_id))
+        payload = Payload(
+            update=update,
+            ctx=ctx,
+            text=text,
+            images=images,
+            update_id=update_id,
+        )
+        await _record_pending_payload(payload)
+        with suppress(Exception):
+            await chat.send_action("typing")
+        await _worker().submit(payload)
     except Exception as e:
         log.error("enqueue failed: %s", e)
         await msg.reply_text(f"Error: {e}")
@@ -3607,6 +4121,7 @@ async def _post_init(app: Application) -> None:
     # 跑完再退 (cmd_restart / launchd SIGTERM / Ctrl+C 都走这条).
     _install_signal_handlers(app)
     await _sync_bot_commands(app.bot)
+    await _replay_pending_updates(app)
 
     # 意外重启 / launchd kickstart / 任务中 /restart → bot 重连后主动告知 V 当
     # 前 session 号. 不走 hook (hook 只在 session 边界触发, bot 重启时 sid 没变).
@@ -3670,6 +4185,8 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(_with_transcript("cb_verbose", on_verbose_click), pattern=r"^verbose:"))
     app.add_handler(CallbackQueryHandler(_with_transcript("cb_cpu", on_cpu_click), pattern=r"^cpu:"))
     app.add_handler(CallbackQueryHandler(_with_transcript("cb_provider", on_provider_click), pattern=r"^provider:"))
+    app.add_handler(CallbackQueryHandler(_with_transcript("cb_codex", on_codex_click), pattern=r"^codex:"))
+    app.add_handler(CallbackQueryHandler(_with_transcript("cb_codex_add", on_codex_add_click), pattern=r"^codex_add:"))
     # resume-ch: / resume-back / resume: 三个 pattern 互斥 (第 7 字符不同),
     # 注册顺序无关紧要; 仍按 specific → generic 排列利于阅读.
     app.add_handler(CallbackQueryHandler(_with_transcript("cb_resume_channel", on_resume_channel_pick), pattern=r"^resume-ch:"))

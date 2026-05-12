@@ -78,7 +78,14 @@ class FakeUser:
 
 
 class FakeUpdate:
-    def __init__(self, message: FakeMessage, chat: FakeChat, user_id: int | None = None):
+    def __init__(
+        self,
+        message: FakeMessage,
+        chat: FakeChat,
+        user_id: int | None = None,
+        update_id: int | None = None,
+    ):
+        self.update_id = update_id
         self.effective_message = message
         self.message = message
         self.effective_chat = chat
@@ -111,12 +118,21 @@ class FakeBot:
     def __init__(self):
         self.reactions: list[tuple[int, int, str]] = []
         self.commands: list[tuple[str, str]] = []
+        self.sent_messages: list[dict] = []
+        self.chat_actions: list[tuple[int, str]] = []
 
     async def set_message_reaction(self, *, chat_id, message_id, reaction):
         self.reactions.append((chat_id, message_id, reaction))
 
     async def set_my_commands(self, commands):
         self.commands = list(commands)
+
+    async def send_chat_action(self, *, chat_id, action):
+        self.chat_actions.append((chat_id, action))
+
+    async def send_message(self, **kwargs):
+        self.sent_messages.append(kwargs)
+        return FakeSentMessage(kwargs["text"])
 
 
 class FakeCtx:
@@ -174,6 +190,10 @@ async def wait_for(predicate, timeout: float = 1.0):
 def reset_bot_globals(monkeypatch, tmp_path):
     monkeypatch.setattr(bot, "bridge", FakeBridge())
     monkeypatch.setattr(bot, "_STATE_PATH", tmp_path / "state.json")
+    monkeypatch.setattr(bot, "PROCESSED_UPDATES_FILE", tmp_path / "processed.json")
+    monkeypatch.setattr(bot, "PENDING_UPDATES_FILE", tmp_path / "pending.json")
+    bot._processed_set = set()
+    bot._pending_update_records = {}
     bot._state = {}
     bot._verbose = 1
     bot._in_flight = 0
@@ -275,15 +295,18 @@ def test_bot_commands_are_filtered_by_cpu():
     assert "provider" in claude
     assert "context" not in codex
     assert "stop" not in codex
-    assert "provider" not in codex
-    assert {"new", "resume", "status", "verbose", "cpu", "restart"} <= set(codex)
+    assert "provider" in codex
+    assert {"new", "resume", "status", "verbose", "cpu", "restart", "provider"} <= set(codex)
 
 
-def test_codex_rejects_hidden_commands_when_typed(monkeypatch, tmp_path):
+def test_codex_rejects_hidden_claude_commands_and_shows_provider(monkeypatch, tmp_path):
     async def run():
         reset_bot_globals(monkeypatch, tmp_path)
         monkeypatch.setattr(bot, "ALLOWED_USER", 7)
         monkeypatch.setattr(bot, "cc", FakeCpuSession("codex"))
+        monkeypatch.setattr(bot, "_current_codex_key", lambda: "personal")
+        monkeypatch.setattr(bot, "_current_codex_label", lambda: "Codex · personal")
+        monkeypatch.setattr(bot, "_codex_choices", lambda: [("Codex · personal", "personal")])
 
         ctx = FakeCtx()
         chat = FakeChat()
@@ -298,7 +321,7 @@ def test_codex_rejects_hidden_commands_when_typed(monkeypatch, tmp_path):
 
         provider_msg = FakeMessage(12, "/provider")
         await bot.cmd_provider(FakeUpdate(provider_msg, chat, user_id=7), ctx)
-        assert "不生效" in provider_msg.replies[-1].text
+        assert "Codex 账号" in provider_msg.replies[-1].text
 
     asyncio.run(run())
 
@@ -318,7 +341,7 @@ def test_codex_rejects_provider_callback(monkeypatch, tmp_path):
         await bot.on_provider_click(FakeCallbackUpdate(query), FakeCtx())
 
         assert query.answers == [(None, {})]
-        assert "不生效" in query.edits[-1][0]
+        assert "失效" in query.edits[-1][0]
 
     asyncio.run(run())
 
@@ -622,6 +645,87 @@ def test_channel_worker_cut_in_waits_for_next_turn(monkeypatch, tmp_path):
     asyncio.run(run())
 
 
+def test_channel_worker_codex_coalesces_pending_cut_ins(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        processed: list[int] = []
+
+        async def fake_mark_processed(update_id):
+            if update_id is not None:
+                processed.append(update_id)
+
+        monkeypatch.setattr(bot, "_mark_processed", fake_mark_processed)
+        session = FakeSession()
+        session.supports_hot_input = False
+        worker = bot.ChannelWorker(session, instance_label="test")
+        await worker.start()
+
+        chat = FakeChat(chat_id=42)
+        ctx = FakeCtx()
+        m1 = FakeMessage(1, "first")
+        m2 = FakeMessage(2, "second")
+        m3 = FakeMessage(3, "third")
+
+        await worker.submit(
+            bot.Payload(
+                update=FakeUpdate(m1, chat),
+                ctx=ctx,
+                text="first",
+                update_id=101,
+            )
+        )
+        await worker.submit(
+            bot.Payload(
+                update=FakeUpdate(m2, chat),
+                ctx=ctx,
+                text="second",
+                update_id=102,
+            )
+        )
+        await worker.submit(
+            bot.Payload(
+                update=FakeUpdate(m3, chat),
+                ctx=ctx,
+                text="third",
+                update_id=103,
+            )
+        )
+
+        assert session.submitted == [("first", None)]
+
+        session.queue.put_nowait(
+            Event(
+                kind="turn_end",
+                response=Response(content="done1", session_id="sid-1", cost=0.01),
+            )
+        )
+        await wait_for(lambda: len(session.submitted) == 2)
+        prompt, images = session.submitted[1]
+        assert images is None
+        assert "follow-up Telegram messages" in prompt
+        assert "<user_message n=1 update_id=102 message_id=2>" in prompt
+        assert "second" in prompt
+        assert "<user_message n=2 update_id=103 message_id=3>" in prompt
+        assert "third" in prompt
+        assert processed == [101]
+
+        session.queue.put_nowait(
+            Event(
+                kind="turn_end",
+                response=Response(content="batch done", session_id="sid-2", cost=0.01),
+            )
+        )
+        await wait_for(lambda: processed == [101, 102, 103])
+        await wait_for(lambda: (42, 2, "👌") in ctx.bot.reactions)
+        await wait_for(lambda: (42, 3, "👌") in ctx.bot.reactions)
+        assert len(m2.replies) == 0
+        assert any("batch done" in r.text for r in m3.replies)
+        await wait_for(lambda: bot._in_flight == 0)
+
+        await worker.stop()
+
+    asyncio.run(run())
+
 def test_channel_worker_reaction_eye_then_ok_single_turn(monkeypatch, tmp_path):
     """单条消息: submit → 👀 立即 fire (因为 _begin_turn inline); turn_end → 👌."""
     async def run():
@@ -697,6 +801,187 @@ def test_channel_worker_reaction_back_to_back_messages(monkeypatch, tmp_path):
         )
         await wait_for(lambda: (42, 2, "👌") in ctx.bot.reactions)
         await wait_for(lambda: bot._in_flight == 0)
+
+        await worker.stop()
+
+    asyncio.run(run())
+
+
+def test_channel_worker_stream_error_replays_active_then_pending(monkeypatch, tmp_path):
+    """Recoverable CPU stream error must replay N before continuing N+1.
+
+    The old behavior marked active+pending as processed and 💔, permanently
+    dropping the queue. The required channel contract is FIFO replay after the
+    supervisor reconnects.
+    """
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        processed: list[int] = []
+
+        async def fake_mark_processed(update_id):
+            if update_id is not None:
+                processed.append(update_id)
+
+        monkeypatch.setattr(bot, "_mark_processed", fake_mark_processed)
+        session = FakeSession()
+        worker = bot.ChannelWorker(session, instance_label="test")
+        await worker.start()
+
+        chat = FakeChat(chat_id=42)
+        m1 = FakeMessage(1, "first")
+        m2 = FakeMessage(2, "second")
+        ctx = FakeCtx()
+
+        await worker.submit(
+            bot.Payload(
+                update=FakeUpdate(m1, chat),
+                ctx=ctx,
+                text="first",
+                update_id=101,
+            )
+        )
+        await worker.submit(
+            bot.Payload(
+                update=FakeUpdate(m2, chat),
+                ctx=ctx,
+                text="second",
+                update_id=102,
+            )
+        )
+        assert session.submitted == [("first", None)]
+
+        session.queue.put_nowait(Event(kind="error", exception=RuntimeError("boom")))
+
+        # After reconnect, m1 is replayed first; m2 stays queued.
+        await wait_for(lambda: session.submitted == [("first", None), ("first", None)])
+        assert processed == []
+        assert (42, 1, "💔") not in ctx.bot.reactions
+        assert (42, 2, "💔") not in ctx.bot.reactions
+        assert bot._in_flight == 1
+        assert worker._turn_anchor == 1
+
+        session.queue.put_nowait(
+            Event(
+                kind="turn_end",
+                response=Response(content="ok1", session_id="sid-1", cost=0.01),
+            )
+        )
+        await wait_for(
+            lambda: session.submitted == [
+                ("first", None),
+                ("first", None),
+                ("second", None),
+            ]
+        )
+        await wait_for(lambda: 101 in processed)
+        assert (42, 1, "👌") in ctx.bot.reactions
+        assert worker._turn_anchor == 2
+
+        session.queue.put_nowait(
+            Event(
+                kind="turn_end",
+                response=Response(content="ok2", session_id="sid-2", cost=0.01),
+            )
+        )
+        await wait_for(lambda: 102 in processed)
+        await wait_for(lambda: bot._in_flight == 0)
+        assert (42, 2, "👌") in ctx.bot.reactions
+        assert (42, 2, "💔") not in ctx.bot.reactions
+
+        await worker.stop()
+
+    asyncio.run(run())
+
+
+def test_tg_pending_update_replays_after_restart_and_acks(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+
+        session1 = FakeSession()
+        worker1 = bot.ChannelWorker(session1, instance_label="test")
+        monkeypatch.setattr(bot, "_channel_worker", worker1)
+        await worker1.start()
+
+        ctx = FakeCtx()
+        chat = FakeChat(chat_id=42)
+        msg = FakeMessage(7, "needs replay")
+        update = FakeUpdate(msg, chat, user_id=7, update_id=501)
+
+        await bot._process(update, ctx, "needs replay")
+        assert session1.submitted == [("needs replay", None)]
+        pending = json.loads((tmp_path / "pending.json").read_text())["pending"]
+        assert pending["501"]["text"] == "needs replay"
+
+        # Simulate process death before turn_end: no processed mark was written.
+        await worker1.stop()
+
+        session2 = FakeSession()
+        worker2 = bot.ChannelWorker(session2, instance_label="test")
+        monkeypatch.setattr(bot, "_channel_worker", worker2)
+        await worker2.start()
+        app = type("FakeApp", (), {"bot": ctx.bot})()
+
+        await bot._replay_pending_updates(app)
+        assert session2.submitted == [("needs replay", None)]
+
+        session2.queue.put_nowait(
+            Event(
+                kind="turn_end",
+                response=Response(content="done", session_id="sid-1", cost=0.01),
+            )
+        )
+        await wait_for(lambda: "501" not in bot._pending_update_records)
+        assert 501 in bot._processed_set
+        assert json.loads((tmp_path / "pending.json").read_text())["pending"] == {}
+        assert ctx.bot.sent_messages[-1]["reply_to_message_id"] == 7
+
+        await worker2.stop()
+
+    asyncio.run(run())
+
+
+def test_tg_replay_pending_fifo_without_interrupt(monkeypatch, tmp_path):
+    async def run():
+        reset_bot_globals(monkeypatch, tmp_path)
+        ctx = FakeCtx()
+        bot._pending_update_records = {
+            "501": {
+                "update_id": 501,
+                "chat_id": 42,
+                "message_id": 7,
+                "text": "first",
+                "images": [],
+                "received_at": 1.0,
+            },
+            "502": {
+                "update_id": 502,
+                "chat_id": 42,
+                "message_id": 8,
+                "text": "second",
+                "images": [],
+                "received_at": 2.0,
+            },
+        }
+
+        session = FakeSession()
+        worker = bot.ChannelWorker(session, instance_label="test")
+        monkeypatch.setattr(bot, "_channel_worker", worker)
+        await worker.start()
+
+        app = type("FakeApp", (), {"bot": ctx.bot})()
+        await bot._replay_pending_updates(app)
+
+        assert session.submitted == [("first", None)]
+        assert session.interrupted is False
+        assert [p.text for p in worker._pending_payloads] == ["second"]
+
+        session.queue.put_nowait(
+            Event(
+                kind="turn_end",
+                response=Response(content="done1", session_id="sid-1", cost=0.01),
+            )
+        )
+        await wait_for(lambda: session.submitted == [("first", None), ("second", None)])
 
         await worker.stop()
 

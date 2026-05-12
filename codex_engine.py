@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
 import re
+import subprocess
 import tempfile
 import time
 from contextlib import suppress
@@ -38,6 +40,19 @@ _CODEX_SPLIT_ERRORS = (
 )
 _CODEX_STREAM_LIMIT = 64 * 1024 * 1024
 _CODEX_TOOL_RESULT_MAX_CHARS = 4000
+_CODEX_MEMORY_INJECTED_KEY = "codex_memory_injected_sids"
+_DEFAULT_MEMORY_INJECT_SCRIPT = Path.home() / "cc-workspace/scripts/memory-inject.sh"
+_DEFAULT_MEMORY_REFLEX_SCRIPT = Path.home() / "cc-workspace/bin/babata-memory-reflex"
+_DEFAULT_MEMORY_REFLEX_LOG = Path.home() / "cc-workspace/state/memory-reflex/events.jsonl"
+
+
+def _codex_stall_timeout() -> float:
+    raw = os.environ.get("BABATA_CODEX_STALL_TIMEOUT", "1800")
+    try:
+        value = float(raw)
+    except ValueError:
+        return 1800.0
+    return max(0.0, value)
 
 
 def _is_codex_split_error(message: str | None) -> bool:
@@ -79,6 +94,272 @@ def _codex_cwd() -> str:
     if os.environ.get("BABATA_FULL_TRUST") == "1":
         return str(Path.home())
     return str(Path(__file__).parent)
+
+
+def _codex_memory_inject_enabled() -> bool:
+    return os.environ.get("BABATA_CODEX_MEMORY_INJECT", "1") != "0"
+
+
+def _memory_inject_script() -> Path:
+    configured = os.environ.get("BABATA_MEMORY_INJECT_SCRIPT")
+    return Path(configured).expanduser() if configured else _DEFAULT_MEMORY_INJECT_SCRIPT
+
+
+def _memory_inject_timeout() -> float:
+    raw = os.environ.get("BABATA_CODEX_MEMORY_INJECT_TIMEOUT", "5")
+    try:
+        return max(0.1, float(raw))
+    except ValueError:
+        return 5.0
+
+
+def _memory_reflex_enabled() -> bool:
+    return os.environ.get("BABATA_MEMORY_REFLEX", "1") != "0"
+
+
+def _memory_reflex_mode() -> str:
+    if not _memory_reflex_enabled():
+        return "off"
+    mode = os.environ.get("BABATA_MEMORY_REFLEX_MODE", "dry-run").strip().lower()
+    return mode if mode in {"dry-run", "enforce"} else "dry-run"
+
+
+def _memory_reflex_script() -> Path:
+    configured = os.environ.get("BABATA_MEMORY_REFLEX_SCRIPT")
+    return Path(configured).expanduser() if configured else _DEFAULT_MEMORY_REFLEX_SCRIPT
+
+
+def _memory_reflex_timeout() -> float:
+    raw = os.environ.get("BABATA_MEMORY_REFLEX_TIMEOUT", "0.8")
+    try:
+        return max(0.1, float(raw))
+    except ValueError:
+        return 0.8
+
+
+def _memory_source_from_prompt(source_prompt: str) -> str:
+    lower = source_prompt.lower()
+    if "source: telegram" in lower:
+        return "tg"
+    if "source: wechat" in lower:
+        return "wechat"
+    if "source: sidebar" in lower:
+        return "sidebar"
+    return os.environ.get("BABATA_MEMORY_SOURCE") or "unknown"
+
+
+def _memory_reflex_for_prompt(source: str, user_prompt: str | None) -> dict[str, Any]:
+    if not _memory_reflex_enabled() or not user_prompt:
+        return {}
+    script = _memory_reflex_script()
+    if not script.is_file():
+        log.warning("babata memory reflex script missing: %s", script)
+        return {}
+    try:
+        result = subprocess.run(
+            [
+                str(script),
+                "--message", "-",
+                "--source", source,
+                "--cpu", "codex",
+                "--cwd", _codex_cwd(),
+            ],
+            input=user_prompt,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=_memory_reflex_timeout(),
+            check=False,
+        )
+    except Exception as exc:
+        log.warning("babata memory reflex failed: %s", exc)
+        return {}
+    if result.returncode != 0:
+        log.warning("babata memory reflex exited %s: %s", result.returncode, result.stderr.strip()[:500])
+        return {}
+    try:
+        parsed = json.loads(result.stdout)
+    except Exception as exc:
+        log.warning("babata memory reflex returned invalid json: %s", exc)
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _format_memory_reflex_hint(reflex: dict[str, Any]) -> str:
+    routes = [str(r) for r in reflex.get("routes", []) if str(r)]
+    profile = str(reflex.get("profile") or "lite")
+    if not routes or (profile == "lite" and all(r in {"none", "lite"} for r in routes)):
+        return ""
+    reasons = reflex.get("reasons")
+    reason_text = "; ".join(str(r) for r in reasons[:3]) if isinstance(reasons, list) else ""
+    return "\n".join([
+        "<memory-reflex>",
+        f"routes: {', '.join(routes)}",
+        f"profile: {profile}",
+        "note: router signal only; retrieve deeper evidence only when useful.",
+        f"why: {reason_text}" if reason_text else "why: unspecified",
+        "</memory-reflex>",
+    ])
+
+
+def _memory_reflex_log_path() -> Path:
+    configured = os.environ.get("BABATA_MEMORY_REFLEX_LOG")
+    return Path(configured).expanduser() if configured else _DEFAULT_MEMORY_REFLEX_LOG
+
+
+def _message_summary(text: str | None, limit: int = 180) -> str:
+    compact = " ".join((text or "").split())
+    return compact[:limit].rstrip()
+
+
+def _append_memory_reflex_event(payload: dict[str, Any]) -> None:
+    try:
+        path = _memory_reflex_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception as exc:
+        log.warning("babata memory reflex log failed: %s", exc)
+
+
+def _log_memory_reflex_preflight(
+    *,
+    reflex: dict[str, Any],
+    user_prompt: str | None,
+    source: str,
+    cpu: str,
+    mode: str,
+    actual_profile: str,
+    memory_injected: bool,
+    hint_injected: bool,
+) -> str | None:
+    if not reflex:
+        return None
+    now = time.time()
+    digest = hashlib.sha256((user_prompt or "").encode("utf-8")).hexdigest()
+    event_id = hashlib.sha256(f"{now}:{cpu}:{source}:{digest}".encode("utf-8")).hexdigest()[:16]
+    _append_memory_reflex_event({
+        "event": "preflight",
+        "id": event_id,
+        "ts": now,
+        "source": source,
+        "cpu": cpu,
+        "mode": mode,
+        "message_sha256": digest,
+        "message_summary": _message_summary(user_prompt),
+        "router": reflex,
+        "actual_profile": actual_profile,
+        "memory_injected": memory_injected,
+        "hint_injected": hint_injected,
+        "post_answer_observation": "pending",
+    })
+    return event_id
+
+
+def _answer_memory_observation(content: str) -> dict[str, Any]:
+    markers = ("不记得", "没记住", "没有记忆", "没有记录", "查不到", "没查到", "无法确认", "没有找到")
+    return {
+        "heuristic_only": True,
+        "memory_miss_marker": any(marker in content for marker in markers),
+        "wrong_recall": None,
+        "missed_required_lookup": None,
+    }
+
+
+def _log_memory_reflex_post_answer(event_id: str | None, content: str) -> None:
+    if not event_id:
+        return
+    _append_memory_reflex_event({
+        "event": "post_answer",
+        "id": event_id,
+        "ts": time.time(),
+        "answer_sha256": hashlib.sha256((content or "").encode("utf-8")).hexdigest(),
+        "answer_summary": _message_summary(content),
+        "observation": _answer_memory_observation(content or ""),
+    })
+
+
+def _log_memory_reflex_preflight_only(source: str | None, user_prompt: str | None) -> str | None:
+    if os.environ.get("BABATA_CRON_AGENT") == "1":
+        return None
+    source_name = source or "unknown"
+    reflex = _memory_reflex_for_prompt(source_name, user_prompt)
+    mode = _memory_reflex_mode()
+    actual_profile = os.environ.get("BABATA_MEMORY_PROFILE") or "lite"
+    return _log_memory_reflex_preflight(
+        reflex=reflex,
+        user_prompt=user_prompt,
+        source=source_name,
+        cpu="codex",
+        mode=mode,
+        actual_profile=actual_profile,
+        memory_injected=False,
+        hint_injected=False,
+    )
+
+
+def _render_babata_memory_context_event(
+    source: str | None = None,
+    user_prompt: str | None = None,
+) -> tuple[str, str | None]:
+    if not _codex_memory_inject_enabled():
+        return "", None
+    script = _memory_inject_script()
+    if not script.is_file():
+        log.warning("babata memory inject script missing: %s", script)
+        return "", None
+    source_name = source or "unknown"
+    reflex = _memory_reflex_for_prompt(source_name, user_prompt)
+    mode = _memory_reflex_mode()
+    enforce = mode == "enforce"
+    actual_profile = os.environ.get("BABATA_MEMORY_PROFILE") or (
+        str(reflex.get("profile") or "lite") if enforce else "lite"
+    )
+    env = os.environ.copy()
+    env["BABATA_MEMORY_PROFILE"] = actual_profile
+    env.setdefault("BABATA_MEMORY_CPU", "codex")
+    env.setdefault("BABATA_MEMORY_SOURCE", source_name)
+    env.setdefault("BABATA_MEMORY_INCLUDE_TOP", "force")
+    try:
+        result = subprocess.run(
+            [str(script)],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=_memory_inject_timeout(),
+            check=False,
+        )
+    except Exception as exc:
+        log.warning("babata memory inject failed: %s", exc)
+        return "", None
+    if result.returncode != 0:
+        log.warning(
+            "babata memory inject exited %s: %s",
+            result.returncode,
+            result.stderr.strip()[:500],
+        )
+        return "", None
+    parts = [result.stdout.strip()]
+    hint = _format_memory_reflex_hint(reflex) if enforce else ""
+    if hint:
+        parts.append(hint)
+    context = "\n\n".join(part for part in parts if part)
+    event_id = _log_memory_reflex_preflight(
+        reflex=reflex,
+        user_prompt=user_prompt,
+        source=source_name,
+        cpu="codex",
+        mode=mode,
+        actual_profile=actual_profile,
+        memory_injected=bool(context),
+        hint_injected=bool(hint),
+    )
+    return context, event_id
+
+
+def _render_babata_memory_context(source: str | None = None, user_prompt: str | None = None) -> str:
+    return _render_babata_memory_context_event(source, user_prompt)[0]
 
 
 def _toml_key(key: str) -> str:
@@ -178,6 +459,8 @@ def _extract_tool_result(item: dict[str, Any]) -> dict[str, Any]:
 class CodexEngine(CC):
     """One-shot Codex CLI backend with babata-compatible state."""
 
+    supports_hot_input = False
+
     def __init__(
         self,
         *,
@@ -190,6 +473,7 @@ class CodexEngine(CC):
             source_prompt=source_prompt,
             mcp_servers=mcp_servers,
         )
+        self._memory_reflex_event_id: str | None = None
 
     @property
     def session_id(self) -> str | None:
@@ -220,8 +504,8 @@ class CodexEngine(CC):
         try:
             for img in images or []:
                 image_paths.append(_decode_image_to_file(img, image_dir))
-            cmd = self._build_command(prompt, image_paths, last_file)
-            result = await self._run_command(cmd, on_stream)
+            cmd, prompt_stdin, memory_injected = self._build_command(prompt, image_paths, last_file)
+            result = await self._run_command(cmd, prompt_stdin, on_stream)
             content = result["content"]
             if last_file.is_file():
                 with suppress(Exception):
@@ -235,6 +519,10 @@ class CodexEngine(CC):
                     self._fire_hook(_HOOKS_DIR, "session-start.sh", sid)
                 self._session_id = sid
                 self._record_codex_turn(sid, prompt, content)
+                if memory_injected:
+                    self._mark_codex_memory_injected(sid)
+            _log_memory_reflex_post_answer(self._memory_reflex_event_id, content)
+            self._memory_reflex_event_id = None
 
             return Response(
                 content=content,
@@ -260,8 +548,20 @@ class CodexEngine(CC):
         prompt: str,
         image_paths: list[Path],
         last_file: Path,
-    ) -> list[str]:
-        full_prompt = f"{self._source_prompt}\n\n{prompt}" if self._source_prompt else prompt
+    ) -> tuple[list[str], str, bool]:
+        memory_context = ""
+        source = _memory_source_from_prompt(self._source_prompt)
+        should_inject_memory = self._should_inject_codex_memory()
+        if should_inject_memory:
+            memory_context, event_id = _render_babata_memory_context_event(
+                source,
+                prompt,
+            )
+            self._memory_reflex_event_id = event_id
+        else:
+            self._memory_reflex_event_id = _log_memory_reflex_preflight_only(source, prompt)
+        full_prompt = self._build_full_prompt(prompt, memory_context)
+        memory_injected = bool(memory_context)
         base = [
             _codex_cli_path(),
             "-c", "notify=[]",
@@ -293,8 +593,8 @@ class CodexEngine(CC):
                 "-o", str(last_file),
                 *image_args,
                 self._session_id,
-                full_prompt,
-            ]
+                "-",
+            ], full_prompt, memory_injected
         return [
             *base,
             "exec",
@@ -305,19 +605,69 @@ class CodexEngine(CC):
             "-C", _codex_cwd(),
             "-o", str(last_file),
             *image_args,
-            full_prompt,
-        ]
+            "-",
+        ], full_prompt, memory_injected
 
-    async def _run_command(self, cmd: list[str], on_stream: StreamCB | None) -> dict[str, Any]:
+    def _build_full_prompt(self, prompt: str, memory_context: str) -> str:
+        parts = []
+        if self._source_prompt:
+            parts.append(self._source_prompt)
+        if memory_context:
+            parts.append(memory_context)
+        parts.append(prompt)
+        return "\n\n".join(parts)
+
+    def _should_inject_codex_memory(self) -> bool:
+        if not _codex_memory_inject_enabled():
+            return False
+        if os.environ.get("BABATA_CRON_AGENT") == "1":
+            return False
+        if _memory_reflex_mode() == "enforce":
+            return True
+        if not self._session_id:
+            return True
+        state = self._load_state()
+        injected = state.get(_CODEX_MEMORY_INJECTED_KEY)
+        if not isinstance(injected, list):
+            return True
+        return self._session_id not in {str(sid) for sid in injected}
+
+    def _mark_codex_memory_injected(self, sid: str) -> None:
+        state = self._load_state()
+        injected = state.get(_CODEX_MEMORY_INJECTED_KEY)
+        if not isinstance(injected, list):
+            injected = []
+        history = [str(item) for item in injected if str(item) != sid]
+        history.insert(0, sid)
+        state[_CODEX_MEMORY_INJECTED_KEY] = history[:_CODEX_RECENT_LIMIT]
+        self._save_state(state)
+
+    async def _run_command(
+        self,
+        cmd: list[str],
+        prompt_stdin: str,
+        on_stream: StreamCB | None,
+    ) -> dict[str, Any]:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
-            stdin=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             limit=_CODEX_STREAM_LIMIT,
         )
         assert proc.stdout is not None
         assert proc.stderr is not None
+        proc_stdin = getattr(proc, "stdin", None)
+        if proc_stdin is not None:
+            with suppress(BrokenPipeError, ConnectionResetError):
+                proc_stdin.write(prompt_stdin.encode())
+                await proc_stdin.drain()
+            with suppress(Exception):
+                proc_stdin.close()
+            wait_closed = getattr(proc_stdin, "wait_closed", None)
+            if wait_closed is not None:
+                with suppress(Exception):
+                    await wait_closed()
         stderr_task = asyncio.create_task(proc.stderr.read())
         sid: str | None = None
         content = ""
@@ -332,7 +682,26 @@ class CodexEngine(CC):
                 tools.append(name)
 
         try:
-            async for raw in proc.stdout:
+            stall_timeout = _codex_stall_timeout()
+            while True:
+                try:
+                    if stall_timeout > 0:
+                        raw = await asyncio.wait_for(
+                            proc.stdout.readline(),
+                            timeout=stall_timeout,
+                        )
+                    else:
+                        raw = await proc.stdout.readline()
+                except asyncio.TimeoutError:
+                    with suppress(ProcessLookupError, Exception):
+                        proc.terminate()
+                    with suppress(asyncio.TimeoutError, Exception):
+                        await asyncio.wait_for(proc.wait(), timeout=5)
+                    raise RuntimeError(
+                        f"codex stalled: no stdout event for {stall_timeout:.0f}s"
+                    )
+                if not raw:
+                    break
                 line = raw.decode("utf-8", errors="replace").strip()
                 if not line:
                     continue
