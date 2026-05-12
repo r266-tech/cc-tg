@@ -144,6 +144,7 @@ class SidebarBridge:
         self._server = await asyncio.start_unix_server(
             self._handle_connection, path=SOCKET_PATH
         )
+        os.chmod(SOCKET_PATH, 0o600)
         log.info("sidebar bridge listening at %s", SOCKET_PATH)
 
     async def stop(self) -> None:

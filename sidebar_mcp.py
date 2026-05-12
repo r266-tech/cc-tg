@@ -8,7 +8,7 @@ connected browser extension SW over WebSocket.
 V0 哲学: 给 LLM raw primitive 不给 workflow.
 - Browser-side: raw DOM/page primitive (tab_metadata / dom_query / dom_inject
   / dom_set / dom_click / page_snapshot / page_click_ref + tab_navigate).
-  LLM compose 它们做任意操作 — 抓正文 / inline 翻译注入 / 表单填写 / 点击.
+  LLM compose 它们做任意页面读写 — 抓正文 / 表单填写 / 点击 / 显式注释.
 - Server-side: translate (raw 翻译, 不带抓注入副作用) + suggest_prompts (推
   chip).
 """
@@ -32,11 +32,11 @@ server = Server("sidebar")
 _TARGET_FIELDS = {
     "tab_id": {
         "type": "integer",
-        "description": "Target Chrome tab id from page_context. Prefer passing this for page tools.",
+        "description": "Target browser tab id from page_context. Prefer passing this for page tools.",
     },
     "window_id": {
         "type": "integer",
-        "description": "Target Chrome window id from page_context. Fallback when tab_id is unavailable.",
+        "description": "Target browser window id from page_context. Fallback when tab_id is unavailable.",
     },
 }
 
@@ -87,9 +87,10 @@ async def list_tools() -> list[Tool]:
             name="dom_inject",
             description=(
                 "insertAdjacentHTML on every element matching selector. position: "
-                "beforebegin | afterbegin | beforeend (default) | afterend. Use to "
-                "render translation under each paragraph, attach annotations, etc. "
-                "Returns {count}."
+                "beforebegin | afterbegin | beforeend (default) | afterend. Use for "
+                "explicit page annotations or small UI helpers when V asks for page "
+                "modification. Automatic page translation is handled by the content "
+                "script /translate path, not this tool. Returns {count}."
             ),
             inputSchema={
                 "type": "object",
@@ -109,9 +110,10 @@ async def list_tools() -> list[Tool]:
             name="dom_set",
             description=(
                 "Set property on every match. prop: value (sets input/textarea + "
-                "fires input/change events) | textContent | innerHTML | <any "
-                "attribute name>. Use for filling forms / replacing element text "
-                "for translation. Returns {count}."
+                "fires input/change events) | textContent | <any "
+                "attribute name>. Use for filling forms or explicit page edits. "
+                "Automatic page translation is handled by the content script "
+                "/translate path, not this tool. Returns {count}."
             ),
             inputSchema={
                 "type": "object",
@@ -129,8 +131,8 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Synthetic .click() on first match. Returns {ok}. NOTE: synthetic "
                 "(not isTrusted=true); some captcha-protected / OAuth buttons "
-                "won't fire — V0 #6 will add cdp_input via chrome.debugger for "
-                "trusted input."
+                "won't fire. If that happens, report the limitation instead of "
+                "claiming trusted input."
             ),
             inputSchema={
                 "type": "object",
@@ -175,7 +177,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="tab_navigate",
-            description="chrome.tabs.update({url}) on active tab. Returns {ok, tab_id, url}.",
+            description="Navigate the target tab to url. Returns {ok, tab_id, url}.",
             inputSchema={
                 "type": "object",
                 "properties": {"url": {"type": "string"}, **_TARGET_FIELDS},
