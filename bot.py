@@ -98,6 +98,26 @@ def _load_processed() -> set[int]:
 _processed_lock = asyncio.Lock()
 _processed_set: set[int] = _load_processed()  # 模块加载即填充 (sync read)
 
+
+@dataclass(frozen=True)
+class PendingReplaySummary:
+    total: int = 0
+    replayed: int = 0
+    skipped_processed: int = 0
+    malformed: int = 0
+    failed: int = 0
+
+
+def _pending_replay_notice_lines(summary: PendingReplaySummary) -> list[str]:
+    lines: list[str] = []
+    if summary.replayed:
+        lines.append(f"已恢复 {summary.replayed} 个未完成任务")
+    if summary.failed or summary.malformed:
+        failed = summary.failed + summary.malformed
+        lines.append(f"⚠️ {failed} 个未完成任务恢复失败，见日志")
+    return lines
+
+
 def _load_pending_updates() -> dict[str, dict[str, Any]]:
     if not PENDING_UPDATES_FILE.exists():
         return {}
@@ -2141,11 +2161,11 @@ def _worker() -> ChannelWorker:
     return _channel_worker
 
 
-async def _replay_pending_updates(app: Application) -> None:
+async def _replay_pending_updates(app: Application) -> PendingReplaySummary:
     async with _pending_updates_lock:
         records = list(_pending_update_records.values())
     if not records:
-        return
+        return PendingReplaySummary()
 
     def _sort_key(record: dict[str, Any]) -> tuple[float, int]:
         try:
@@ -2159,25 +2179,39 @@ async def _replay_pending_updates(app: Application) -> None:
         return (received, update_id)
 
     replayed = 0
+    skipped_processed = 0
+    malformed = 0
+    failed = 0
     for record in sorted(records, key=_sort_key):
         try:
             update_id = int(record.get("update_id"))
         except (TypeError, ValueError):
+            malformed += 1
             continue
         if update_id in _processed_set:
             await _ack_pending_update(update_id)
+            skipped_processed += 1
             continue
         payload = _payload_from_pending_record(app.bot, record)
         if payload is None:
             log.warning("pending update record is malformed: update_id=%s", update_id)
+            malformed += 1
             continue
         try:
             await _worker().submit(payload, interrupt_active=False)
             replayed += 1
         except Exception as e:
             log.warning("pending update replay failed: update_id=%s: %s", update_id, e)
+            failed += 1
     if replayed:
         log.warning("replayed %d unconsumed TG update(s) from pending journal", replayed)
+    return PendingReplaySummary(
+        total=len(records),
+        replayed=replayed,
+        skipped_processed=skipped_processed,
+        malformed=malformed,
+        failed=failed,
+    )
 
 
 # ── Handlers ──────────────────────────────────────────────────────────
@@ -4121,7 +4155,7 @@ async def _post_init(app: Application) -> None:
     # 跑完再退 (cmd_restart / launchd SIGTERM / Ctrl+C 都走这条).
     _install_signal_handlers(app)
     await _sync_bot_commands(app.bot)
-    await _replay_pending_updates(app)
+    pending_replay = await _replay_pending_updates(app)
 
     # 意外重启 / launchd kickstart / 任务中 /restart → bot 重连后主动告知 V 当
     # 前 session 号. 不走 hook (hook 只在 session 边界触发, bot 重启时 sid 没变).
@@ -4140,6 +4174,7 @@ async def _post_init(app: Application) -> None:
         startup_trigger = _pop_restart_reason()
         if startup_trigger:
             lines.append(f"上次重启原因: {startup_trigger}")
+        lines.extend(_pending_replay_notice_lines(pending_replay))
         if sid and cc.is_last_turn_orphan(sid):
             lines.append("⚠️ 上次 session 最后一条 user 无 assistant 回复 (可能 SIGKILL)")
         try:

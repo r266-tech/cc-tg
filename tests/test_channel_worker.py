@@ -921,7 +921,10 @@ def test_tg_pending_update_replays_after_restart_and_acks(monkeypatch, tmp_path)
         await worker2.start()
         app = type("FakeApp", (), {"bot": ctx.bot})()
 
-        await bot._replay_pending_updates(app)
+        replay = await bot._replay_pending_updates(app)
+        assert replay.total == 1
+        assert replay.replayed == 1
+        assert replay.failed == 0
         assert session2.submitted == [("needs replay", None)]
 
         session2.queue.put_nowait(
@@ -969,7 +972,10 @@ def test_tg_replay_pending_fifo_without_interrupt(monkeypatch, tmp_path):
         await worker.start()
 
         app = type("FakeApp", (), {"bot": ctx.bot})()
-        await bot._replay_pending_updates(app)
+        replay = await bot._replay_pending_updates(app)
+        assert replay.total == 2
+        assert replay.replayed == 2
+        assert replay.failed == 0
 
         assert session.submitted == [("first", None)]
         assert session.interrupted is False
@@ -986,6 +992,16 @@ def test_tg_replay_pending_fifo_without_interrupt(monkeypatch, tmp_path):
         await worker.stop()
 
     asyncio.run(run())
+
+
+def test_tg_startup_notice_surfaces_pending_replay_summary():
+    assert bot._pending_replay_notice_lines(
+        bot.PendingReplaySummary(total=1, replayed=1)
+    ) == ["已恢复 1 个未完成任务"]
+
+    assert bot._pending_replay_notice_lines(
+        bot.PendingReplaySummary(total=3, replayed=2, failed=1)
+    ) == ["已恢复 2 个未完成任务", "⚠️ 1 个未完成任务恢复失败，见日志"]
 
 
 def test_channel_worker_new_message_reply_does_not_merge(monkeypatch, tmp_path):
