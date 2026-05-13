@@ -18,6 +18,18 @@ if [ -f "$ENV_FILE" ] && [ -z "${PROJECT_STATE_DIR:-}" ]; then
 fi
 
 LABEL_PREFIX="com.${PROJECT_NAMESPACE:-babata}"
+RESTART_IDLE_WAIT_SECONDS="${RESTART_IDLE_WAIT_SECONDS:-3600}"
+
+runtime_file_for_label() {
+    local label="$1"
+    local prefix="$LABEL_PREFIX"
+    local instance=""
+    if [ "$label" != "$prefix" ]; then
+        instance="${label#${prefix}.}"
+    fi
+    local state_dir="${PROJECT_STATE_DIR:-$REPO_DIR/state}"
+    printf '%s/runtime-status-%s.json\n' "$state_dir" "$instance"
+}
 
 restart() {
     local label="${1:-$LABEL_PREFIX}"
@@ -47,13 +59,8 @@ restart() {
         local depth=0
         while [ "$p" != "1" ] && [ "$p" != "0" ] && [ "$depth" -lt 12 ]; do
             if [ "$p" = "$target_pid" ]; then
-                echo "REFUSE: self-suicide — caller (pid $$) runs under $label (live pid $target_pid)." >&2
-                echo "        Inline kickstart -k would SIGKILL the current Claude turn." >&2
-                echo "        Workarounds:" >&2
-                echo "          • V triggers /restart in TG (out-of-band)" >&2
-                echo "          • Wait for com.v.babata-daily-restart (4am)" >&2
-                echo "          • Defer: \`echo 'launchctl kickstart -k gui/$UID_N/$label' | at now + 2 minutes\`" >&2
-                return 2
+                echo "DETACH: caller runs under $label; scheduling out-of-band helper." >&2
+                break
             fi
             # Dead ancestor mid-walk → ps returns non-zero. `|| break`
             # turns that into "stop walking, proceed to kickstart"
@@ -81,9 +88,86 @@ restart() {
             printf '%s\n' "manual: self-ops restart" > "$state_dir/restart-reason-${label}.txt"
         } || echo "WARN: failed to write restart-reason file, kickstarting anyway"
     fi
-    nohup bash -c "sleep $DELAY && launchctl kickstart -k gui/$UID_N/$label" >/dev/null 2>&1 &
-    disown
+    local runtime_file
+    runtime_file="$(runtime_file_for_label "$label")"
+    local helper="${label}.restart.$(date +%s).$$"
+    launchctl submit -l "$helper" -- /bin/bash -lc '
+        delay="$1"
+        uid_n="$2"
+        label="$3"
+        helper="$4"
+        runtime_file="$5"
+        wait_s="$6"
+        sleep "$delay"
+        deadline=$(( $(date +%s) + wait_s ))
+        while [ -f "$runtime_file" ]; do
+            busy=$(python3 - "$runtime_file" <<'"'"'PY'"'"' 2>/dev/null || echo 0
+import json, sys, time
+try:
+    data=json.load(open(sys.argv[1]))
+    fresh=time.time()-float(data.get("ts", 0)) < 120
+    print(1 if fresh and int(data.get("in_flight") or 0) > 0 else 0)
+except Exception:
+    print(0)
+PY
+)
+            [ "$busy" != "1" ] && break
+            [ "$(date +%s)" -ge "$deadline" ] && break
+            sleep 1
+        done
+        launchctl kickstart -k "gui/$uid_n/$label"
+        launchctl remove "$helper" >/dev/null 2>&1 || true
+    ' bash "$DELAY" "$UID_N" "$label" "$helper" "$runtime_file" "$RESTART_IDLE_WAIT_SECONDS"
     echo "已排队: ${DELAY}s 后 kickstart -k $label"
+}
+
+reload_plist() {
+    local label="${1:-$LABEL_PREFIX}"
+    local plist="${2:-$HOME/Library/LaunchAgents/${label}.plist}"
+    if [ ! -f "$plist" ]; then
+        echo "ERR: plist not found: $plist" >&2
+        return 1
+    fi
+    if [ "$label" != "${LABEL_PREFIX}.weixin" ]; then
+        local state_dir="${PROJECT_STATE_DIR:-$REPO_DIR/state}"
+        {
+            mkdir -p "$state_dir" && \
+            printf '%s\n' "manual: self-ops reload-plist" > "$state_dir/restart-reason-${label}.txt"
+        } || echo "WARN: failed to write restart-reason file, reloading anyway"
+    fi
+    local helper="${label}.reload.$(date +%s).$$"
+    local runtime_file
+    runtime_file="$(runtime_file_for_label "$label")"
+    launchctl submit -l "$helper" -- /bin/bash -lc '
+        delay="$1"
+        uid_n="$2"
+        label="$3"
+        plist="$4"
+        helper="$5"
+        runtime_file="$6"
+        wait_s="$7"
+        sleep "$delay"
+        deadline=$(( $(date +%s) + wait_s ))
+        while [ -f "$runtime_file" ]; do
+            busy=$(python3 - "$runtime_file" <<'"'"'PY'"'"' 2>/dev/null || echo 0
+import json, sys, time
+try:
+    data=json.load(open(sys.argv[1]))
+    fresh=time.time()-float(data.get("ts", 0)) < 120
+    print(1 if fresh and int(data.get("in_flight") or 0) > 0 else 0)
+except Exception:
+    print(0)
+PY
+)
+            [ "$busy" != "1" ] && break
+            [ "$(date +%s)" -ge "$deadline" ] && break
+            sleep 1
+        done
+        launchctl bootout "gui/$uid_n/$label" 2>/dev/null || true
+        launchctl bootstrap "gui/$uid_n" "$plist"
+        launchctl remove "$helper" >/dev/null 2>&1 || true
+    ' bash "$DELAY" "$UID_N" "$label" "$plist" "$helper" "$runtime_file" "$RESTART_IDLE_WAIT_SECONDS"
+    echo "已排队: ${DELAY}s 后 reload $label from $plist"
 }
 
 bootstrap_plist() {
@@ -102,7 +186,8 @@ update_claude() {
 
 case "${1:-}" in
     restart)        shift; restart "$@" ;;
+    reload-plist)   shift; reload_plist "$@" ;;
     bootstrap)      shift; bootstrap_plist "$@" ;;
     update-claude)  update_claude ;;
-    *) echo "Usage: $0 {restart [<label>] | bootstrap <plist> | update-claude}" >&2; exit 1 ;;
+    *) echo "Usage: $0 {restart [<label>] | reload-plist [<label> [<plist>]] | bootstrap <plist> | update-claude}" >&2; exit 1 ;;
 esac

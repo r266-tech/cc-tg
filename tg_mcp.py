@@ -5,6 +5,7 @@ CC CLI connects via stdio; we relay requests to the bot through Unix socket.
 """
 
 import asyncio
+import errno
 import json
 import logging
 import os
@@ -22,6 +23,13 @@ log = logging.getLogger(__name__)
 # env dict when spawning this subprocess; constants.py reads that env and
 # falls back to the derived namespace-based default for standalone MCP runs.
 SOCKET_PATH = BRIDGE_SOCKET
+_BRIDGE_CONNECT_RETRY_SECONDS = float(os.environ.get("TG_BRIDGE_CONNECT_RETRY_SECONDS", "90"))
+_BRIDGE_CONNECT_RETRY_INTERVAL = float(os.environ.get("TG_BRIDGE_CONNECT_RETRY_INTERVAL", "1"))
+_RETRYABLE_CONNECT_ERRNOS = {
+    errno.ENOENT,
+    errno.ECONNREFUSED,
+    errno.ECONNRESET,
+}
 
 # TG bot instances exposed via optional `instance` tool argument. Derived from
 # INSTANCE_LABELS so OSS forks inherit the map automatically. WeChat has its
@@ -238,7 +246,7 @@ async def list_tools() -> list[Tool]:
 async def _relay(action: str, instance: str | None = None, **kwargs) -> str:
     """Send action to bridge, await result."""
     socket_path = _socket_for_instance(instance)
-    reader, writer = await asyncio.open_unix_connection(socket_path)
+    reader, writer = await _open_bridge(socket_path)
     try:
         request = json.dumps({"action": action, **kwargs})
         writer.write(request.encode() + b"\n")
@@ -248,6 +256,30 @@ async def _relay(action: str, instance: str | None = None, **kwargs) -> str:
     finally:
         writer.close()
         await writer.wait_closed()
+
+
+async def _open_bridge(socket_path: str):
+    """Open the bot bridge, waiting through short bot restart windows.
+
+    The MCP server lives inside the CPU process. During a transport restart the
+    Unix socket disappears briefly while the CPU may continue running. Retrying
+    connection setup lets post-restart CPU pushes attach to the new bot instead
+    of failing permanently.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.0, _BRIDGE_CONNECT_RETRY_SECONDS)
+    while True:
+        try:
+            return await asyncio.open_unix_connection(socket_path)
+        except OSError as e:
+            retryable = (
+                isinstance(e, (FileNotFoundError, ConnectionRefusedError, ConnectionResetError))
+                or e.errno in _RETRYABLE_CONNECT_ERRNOS
+            )
+            remaining = deadline - loop.time()
+            if not retryable or remaining <= 0:
+                raise
+            await asyncio.sleep(min(max(0.1, _BRIDGE_CONNECT_RETRY_INTERVAL), remaining))
 
 
 @server.call_tool()

@@ -38,6 +38,7 @@ declare -a CHECKS=(
     "babata|com.babata"
     "babata-vvv|com.babata.vvv"
     "babata-vvvv|com.babata.vvvv"
+    "babata-vvvvv|com.babata.vvvvv"
 )
 
 for entry in "${CHECKS[@]}"; do

@@ -101,6 +101,15 @@ def is_index_file(rel: Path) -> bool:
     return len(rel.parts) == 2 and rel.parts[0] == "indexes" and rel.suffix == ".md"
 
 
+def is_memory_local_l0(rel: Path) -> bool:
+    return len(rel.parts) == 2 and rel.name == "README.md" and rel.parts[0] in {
+        "daily",
+        "rollup",
+        "weekly-reflect",
+        "archive",
+    }
+
+
 def fix_orphans(root: Path, orphans: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Do not auto-append facts to L0.
 
@@ -164,8 +173,9 @@ def run(root: Path, *, json_mode: bool, fix_mode: bool, strict_mode: bool) -> in
                 )
                 continue
 
-            # L0 may link to root hot facts and to indexes/*.md category routers.
-            if not (is_root_memory_file(rel) or is_index_file(rel)):
+            # L0 may link to root hot facts, indexes/*.md category routers, and
+            # local L0 files for memory sublayers.
+            if not (is_root_memory_file(rel) or is_index_file(rel) or is_memory_local_l0(rel)):
                 issues["cross_dir_link"].append(
                     {"file": "MEMORY.md", "line": line_no, "detail": f"unexpected L0 target '{target}'"}
                 )

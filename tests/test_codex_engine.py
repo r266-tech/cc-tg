@@ -380,6 +380,44 @@ def test_codex_live_session_emits_events(monkeypatch, tmp_path):
     asyncio.run(run())
 
 
+def test_codex_live_session_interrupt_cancels_active_turn(monkeypatch, tmp_path):
+    process = None
+
+    async def fake_create(*_cmd, **_kwargs):
+        nonlocal process
+        process = FakeProcess([])
+        process.stdout = HangingStream()
+        return process
+
+    async def run():
+        monkeypatch.setattr(codex_engine.asyncio, "create_subprocess_exec", fake_create)
+        session = codex_engine.CodexLiveSession(
+            state_file=tmp_path / "session.json",
+            source_prompt="Source: test.",
+        )
+        monkeypatch.setattr(session, "_fire_hook", lambda *_: None)
+        await session.connect()
+        agen = session.events()
+        session.submit("go")
+        for _ in range(50):
+            if process is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert process is not None
+
+        await session.interrupt()
+
+        event = await asyncio.wait_for(agen.__anext__(), timeout=1)
+        await agen.aclose()
+        await session.close()
+        assert event.kind == "turn_end"
+        assert "已停止" in event.response.content
+        assert event.response.stopped is True
+        assert process.terminated is True
+
+    asyncio.run(run())
+
+
 def test_make_engine_selects_codex(monkeypatch, tmp_path):
     monkeypatch.setenv("BABATA_ENGINE", "codex")
     made = engine.make_engine(

@@ -3,6 +3,7 @@ import json
 import os
 import sys
 from pathlib import Path
+import pytest
 
 _REPO = Path(__file__).resolve().parents[1]
 _SDK_SITE = next(iter((_REPO / ".venv/lib").glob("python*/site-packages")), None)
@@ -54,7 +55,119 @@ def test_fmt_tool_skips_codex_internal_item_id():
         },
     )
 
-    assert line == "🔧 /bin/zsh: \"/bin/zsh -lc 'echo ok'\""
+    assert line == "💻 Shell · echo"
+    assert "/bin/zsh" not in line
+    assert "item_1" not in line
+
+
+def test_fmt_tool_marks_skill_usage_from_shell_command():
+    line = bot._fmt_tool(
+        "/bin/zsh",
+        {
+            "type": "command_execution",
+            "command": (
+                "/bin/zsh -lc \"sed -n '1,220p' "
+                "~/cc-workspace/babata-skills/second-brain/SKILL.md\""
+            ),
+        },
+    )
+
+    assert line == "📚 Skill · second-brain"
+    assert "sed -n" not in line
+
+
+def test_fmt_tool_marks_memory_injection():
+    line = bot._fmt_tool(
+        "/bin/zsh",
+        {
+            "type": "command_execution",
+            "command": (
+                "~/cc-workspace/bin/babata-memory-context "
+                "--profile lite --cpu codex --source terminal --include-top force"
+            ),
+        },
+    )
+
+    assert line == "🧠 Memory · inject lite (L0+daily-map) · codex/terminal · top force"
+
+
+def test_fmt_tool_summarizes_shell_find_with_target_patterns():
+    line = bot._fmt_tool(
+        "/bin/zsh",
+        {
+            "type": "command_execution",
+            "command": (
+                "/bin/zsh -lc \"find ~/cc-workspace -maxdepth 4 "
+                "\\( -iname '*light*' -o -iname '*home*' -o -iname '*hass*' "
+                "-o -iname '*ha*' -o -iname '*mijia*' -o -iname '*yeelight*' \\) "
+                "-not -path '*/node_modules/*' -print\""
+            ),
+        },
+    )
+
+    assert line == "📂 Find · cc-workspace · light/home/hass/ha/mijia/yeelight"
+    assert "node_modules" not in line
+
+
+def test_fmt_tool_summarizes_shell_file_reads_and_smart_home_commands():
+    read_line = bot._fmt_tool(
+        "/bin/zsh",
+        {
+            "type": "command_execution",
+            "command": "/bin/zsh -lc \"sed -n '1,220p' ~/cc-workspace/skills-catalog/home/README.md\"",
+        },
+    )
+    home_line = bot._fmt_tool(
+        "/bin/zsh",
+        {
+            "type": "command_execution",
+            "command": "~/cc-workspace/skills-catalog/home/smart-home/bin/ha light on",
+        },
+    )
+
+    assert read_line == "📖 Read · home/README.md:1-220"
+    assert home_line == "🏠 Smart-home · light on"
+
+
+def test_fmt_tool_summarizes_common_operational_commands():
+    assert bot._fmt_tool(
+        "/bin/zsh",
+        {"type": "command_execution", "command": "/bin/zsh -lc date"},
+    ) == "🕑 Time · now"
+
+    assert bot._fmt_tool(
+        "/bin/zsh",
+        {
+            "type": "command_execution",
+            "command": "python3 -m pytest tests/test_tg_comm_safety.py -q",
+        },
+    ) == "✅ Test · test_tg_comm_safety.py"
+
+    assert bot._fmt_tool(
+        "/bin/zsh",
+        {
+            "type": "command_execution",
+            "command": (
+                "for label in com.babata com.babata.vvv com.babata.vvvv com.babata.vvvvv; "
+                "do DELAY=3 scripts/self-ops.sh restart \"$label\"; done"
+            ),
+        },
+    ) == "🔁 Restart · TG bots"
+
+    assert bot._fmt_tool(
+        "/bin/zsh",
+        {
+            "type": "command_execution",
+            "command": "sleep 8; launchctl list | rg 'com\\\\.babata'",
+        },
+    ) == "🚀 Launchd · list babata labels"
+
+
+def test_fmt_tool_marks_subagent_and_web_search():
+    assert bot._fmt_tool("Task", {"description": "review bot.py"}) == "👥 Subagent · review bot.py"
+    assert bot._fmt_tool("WebSearch", {"query": "openclaw telegram progress"}) == (
+        "🌐 WebSearch · openclaw telegram progress"
+    )
 
 
 class FakeUser:
@@ -162,5 +275,31 @@ def test_bridge_send_text_chunks_long_messages():
         assert all(item["reply_to_message_id"] == 11 for item in fake_bot.messages)
         response = json.loads(writer.data.decode())
         assert response["result"] == f"Text sent ({len(fake_bot.messages)} chunks)"
+
+    asyncio.run(run())
+
+
+def test_tg_mcp_open_bridge_retries_during_bot_restart(monkeypatch):
+    tg_mcp = pytest.importorskip("tg_mcp")
+
+    async def run():
+        calls = 0
+
+        async def fake_open(path):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise FileNotFoundError("bridge missing")
+            return object(), FakeWriter()
+
+        monkeypatch.setattr(tg_mcp.asyncio, "open_unix_connection", fake_open)
+        monkeypatch.setattr(tg_mcp, "_BRIDGE_CONNECT_RETRY_SECONDS", 1.0)
+        monkeypatch.setattr(tg_mcp, "_BRIDGE_CONNECT_RETRY_INTERVAL", 0.01)
+
+        reader, writer = await tg_mcp._open_bridge("/tmp/missing.sock")
+
+        assert reader is not None
+        assert writer is not None
+        assert calls == 2
 
     asyncio.run(run())

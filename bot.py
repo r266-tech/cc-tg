@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -83,7 +84,31 @@ _TG_MCP_SCRIPT = str(Path(__file__).parent / "tg_mcp.py")
 # 物理无解, V "做到物理极限就行").
 PROCESSED_UPDATES_FILE = STATE_DIR / f"processed-updates-{INSTANCE}.json"
 PENDING_UPDATES_FILE = STATE_DIR / f"pending-updates-{INSTANCE}.json"
+RUNTIME_STATUS_FILE = STATE_DIR / f"runtime-status-{INSTANCE}.json"
 _PROCESSED_MAX = 1000  # 滚动窗口
+
+
+def _write_runtime_status(event: str = "") -> None:
+    try:
+        tmp = RUNTIME_STATUS_FILE.with_suffix(".json.partial")
+        tmp.write_text(
+            json.dumps(
+                {
+                    "event": event,
+                    "pid": os.getpid(),
+                    "ts": time.time(),
+                    "in_flight": _in_flight,
+                    "shutdown_requested": _shutdown_requested,
+                    "pending_updates": len(_pending_update_records),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        os.replace(tmp, RUNTIME_STATUS_FILE)
+    except Exception as e:
+        log.debug("runtime-status write failed: %s", e)
+
 
 def _load_processed() -> set[int]:
     if not PROCESSED_UPDATES_FILE.exists():
@@ -278,11 +303,11 @@ def _bot_commands_for_cpu(cpu: str | None = None) -> list[tuple[str, str]]:
         ("status", "Show model, session, verbose"),
         ("verbose", "Tool display: 0=hidden 1=flash 2=keep"),
         ("cpu", "Switch assistant CPU"),
+        ("stop", "Interrupt current turn"),
         ("restart", "Restart this bot process"),
     ]
     if name == "claude":
         commands.insert(3, ("context", "Context usage breakdown"))
-        commands.insert(6, ("stop", "Interrupt current turn"))
         commands.append(("provider", "切换 Anthropic 渠道"))
     else:  # codex — cmd_provider line 3075 分支切 codex_accounts
         commands.append(("provider", "切换 Codex 账号"))
@@ -313,15 +338,30 @@ _shutdown_requested = False     # debounce: 第二次信号 → 强退
 def _inflight_enter() -> None:
     global _in_flight
     _in_flight += 1
+    _write_runtime_status("inflight_enter")
 
 
 def _inflight_exit() -> None:
     global _in_flight
     _in_flight = max(0, _in_flight - 1)
+    _write_runtime_status("inflight_exit")
+
+
+async def _has_unfinished_channel_work() -> bool:
+    if _in_flight > 0:
+        return True
+    worker = _channel_worker
+    if worker is None:
+        return False
+    try:
+        return await worker.has_unfinished_work()
+    except Exception as e:
+        log.warning("unfinished-work probe failed: %s", e)
+        return _in_flight > 0
 
 
 async def _wait_inflight_drain(poll: float = 0.5) -> None:
-    while _in_flight > 0:
+    while await _has_unfinished_channel_work():
         await asyncio.sleep(poll)
 
 
@@ -371,6 +411,7 @@ async def _graceful_shutdown(app: "Application", reason: str) -> None:
         log.warning("Second shutdown signal (%s), force exit", reason)
         os._exit(1)
     _shutdown_requested = True
+    _write_runtime_status("shutdown_requested")
     log.info("Graceful shutdown requested: %s (in_flight=%d)", reason, _in_flight)
 
     # One-shot read: external trigger 写的具体原因 (e.g. SDK 升级版本号).
@@ -407,6 +448,7 @@ async def _graceful_shutdown(app: "Application", reason: str) -> None:
     # 让 TG round-trip 送出消息再死
     await asyncio.sleep(0.5)
     log.warning("Graceful shutdown complete, exiting pid=%d", os.getpid())
+    _write_runtime_status("shutdown_complete")
     os._exit(0)
 
 
@@ -553,38 +595,457 @@ _TOOL_EMOJI = {
     "ToolSearch": "\U0001f9f0",     # 🧰 toolbox
 }
 
+_SENSITIVE_TOOL_ARG = re.compile(
+    r"(?:api[_-]?key|auth|bearer|credential|password|secret|token)",
+    re.IGNORECASE,
+)
+_SENSITIVE_VALUE = re.compile(
+    r"\b(?:sk|ghp|gho|github_pat|xox[baprs]?)-[A-Za-z0-9_\-]{8,}",
+    re.IGNORECASE,
+)
+
+
+def _compact_tool_text(value: Any, limit: int = 48) -> str:
+    text = " ".join(str(value).split())
+    if not text:
+        return ""
+    if _SENSITIVE_VALUE.search(text):
+        return "[secret]"
+    if len(text) > limit:
+        return text[: max(1, limit - 3)].rstrip() + "..."
+    return text
+
+
+def _tool_line(icon: str, label: str, detail: str = "") -> str:
+    detail = _compact_tool_text(detail, 72)
+    return f"{icon} {label} · {detail}" if detail else f"{icon} {label}"
+
+
+def _shell_label_icon(label: str) -> str:
+    return {
+        "Memory": "\U0001f9e0",  # 🧠
+        "Skill": "\U0001f4da",  # 📚
+        "Search": "\U0001f50d",  # 🔍
+        "Find": "\U0001f4c2",  # 📂
+        "List": "\U0001f4c2",  # 📂
+        "Read": "\U0001f4d6",  # 📖
+        "Smart-home": "\U0001f3e0",  # 🏠
+        "Time": "\U0001f551",  # 🕑
+        "Test": "\u2705",  # ✅
+        "Git": "\U0001f9fe",  # 🧾
+        "Launchd": "\U0001f680",  # 🚀
+        "Restart": "\U0001f501",  # 🔁
+        "Process": "\U0001f4cb",  # 📋
+    }.get(label, "\U0001f4bb")  # 💻
+
+
+def _tool_arg(inp: dict, *keys: str, limit: int = 48) -> str:
+    for key in keys:
+        if _SENSITIVE_TOOL_ARG.search(key):
+            continue
+        value = inp.get(key)
+        if value in (None, ""):
+            continue
+        if isinstance(value, (dict, list)):
+            try:
+                value = json.dumps(value, ensure_ascii=False, default=str)
+            except Exception:
+                value = str(value)
+        preview = _compact_tool_text(value, limit)
+        if preview:
+            return preview
+    return ""
+
+
+def _codex_args(inp: dict) -> dict:
+    raw = inp.get("arguments")
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _first_path_basename(text: str) -> str:
+    matches = re.findall(r"(?:~|/)[^\s'\"\]\)]+", text)
+    for match in matches:
+        name = Path(match).name
+        if name:
+            return name
+    return ""
+
+
+def _short_shell_path(value: str) -> str:
+    value = value.strip().strip("'\"").rstrip(",;")
+    if not value:
+        return ""
+    if not (value.startswith(("/", "~", ".")) or "/" in value):
+        return value
+    parts = [p for p in value.replace("\\ ", " ").split("/") if p and p != "."]
+    if not parts:
+        return value
+    if "skills-catalog" in parts:
+        idx = parts.index("skills-catalog")
+        tail = parts[idx + 1 :]
+        return "/".join(tail[-3:]) if tail else "skills-catalog"
+    if "cc-workspace" in parts:
+        idx = parts.index("cc-workspace")
+        tail = parts[idx:]
+        return "/".join(tail[:2]) if len(tail) > 1 else "cc-workspace"
+    if len(parts) >= 2 and parts[-1] in {"SKILL.md", "README.md"}:
+        return "/".join(parts[-2:])
+    return parts[-1]
+
+
+def _join_preview(items: list[str], limit: int = 6) -> str:
+    cleaned: list[str] = []
+    for item in items:
+        if item and item not in cleaned:
+            cleaned.append(item)
+    if not cleaned:
+        return ""
+    shown = cleaned[:limit]
+    suffix = "/..." if len(cleaned) > limit else ""
+    return "/".join(shown) + suffix
+
+
+def _split_shell_parts(command: str) -> list[str]:
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        parts = command.split()
+    return [p for p in parts if p and not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", p)]
+
+
+def _option_value(parts: list[str], option: str) -> str:
+    if option not in parts:
+        return ""
+    idx = parts.index(option)
+    return parts[idx + 1] if idx + 1 < len(parts) else ""
+
+
+def _memory_context_detail(command: str) -> str:
+    parts = _split_shell_parts(command)
+    profile = _option_value(parts, "--profile")
+    cpu = _option_value(parts, "--cpu")
+    source = _option_value(parts, "--source")
+    include_top = _option_value(parts, "--include-top")
+    profile_hint = {
+        "lite": "L0+daily-map",
+        "recent": "recent+L0",
+        "deep": "deep+L0",
+    }.get(profile, "")
+
+    detail = "inject"
+    if profile:
+        detail += f" {profile}"
+        if profile_hint:
+            detail += f" ({profile_hint})"
+    else:
+        detail += " context"
+    route = "/".join([p for p in (cpu, source) if p])
+    if route:
+        detail += f" · {route}"
+    if include_top:
+        detail += f" · top {include_top}"
+    return detail
+
+
+def _shell_find_detail(parts: list[str]) -> str:
+    roots: list[str] = []
+    patterns: list[str] = []
+    idx = 1
+    while idx < len(parts):
+        item = parts[idx]
+        if item in {"-name", "-iname", "-path", "-ipath"} and idx + 1 < len(parts):
+            pattern = parts[idx + 1].strip("*")
+            if pattern:
+                patterns.append(pattern)
+            idx += 2
+            continue
+        if item in {"-not", "!"}:
+            if idx + 2 < len(parts) and parts[idx + 1] in {"-name", "-iname", "-path", "-ipath"}:
+                idx += 3
+            else:
+                idx += 1
+            continue
+        if item.startswith("-") or item in {"(", ")", "!", "-o"}:
+            idx += 2 if item in {"-maxdepth", "-mindepth", "-type"} else 1
+            continue
+        if not item.startswith(("!", "(")):
+            roots.append(_short_shell_path(item))
+        idx += 1
+    root = ", ".join(roots[:2]) if roots else "files"
+    wanted = _join_preview(patterns)
+    return f"{root} · {wanted}" if wanted else root
+
+
+def _shell_rg_detail(parts: list[str]) -> str:
+    pattern = ""
+    roots: list[str] = []
+    skip_next = False
+    option_args = {"-g", "--glob", "-t", "--type", "-T", "--type-not", "-A", "-B", "-C", "-m", "--max-count"}
+    idx = 1
+    while idx < len(parts):
+        item = parts[idx]
+        if skip_next:
+            skip_next = False
+            idx += 1
+            continue
+        if item in {"-e", "--regexp"} and idx + 1 < len(parts):
+            pattern = pattern or parts[idx + 1]
+            idx += 2
+            continue
+        if item in option_args:
+            skip_next = True
+            idx += 1
+            continue
+        if item.startswith("-"):
+            idx += 1
+            continue
+        if not pattern:
+            pattern = item
+        else:
+            roots.append(_short_shell_path(item))
+        idx += 1
+    terms = _join_preview([p for p in re.split(r"\|+", pattern) if p], 4) or pattern
+    root = ", ".join(roots[:2])
+    if len(roots) > 2:
+        root += ", ..."
+    return f"{terms} in {root}" if root else terms
+
+
+def _shell_sed_detail(parts: list[str]) -> str:
+    line_range = ""
+    path = ""
+    idx = 1
+    while idx < len(parts):
+        item = parts[idx]
+        if item == "-n" and idx + 1 < len(parts):
+            line_range = parts[idx + 1].rstrip("p").replace(",", "-")
+            idx += 2
+            continue
+        if item.startswith("-"):
+            idx += 1
+            continue
+        if "/" in item or item.startswith((".", "~")):
+            path = _short_shell_path(item)
+        idx += 1
+    return f"{path}:{line_range}" if path and line_range else path or "stream"
+
+
+def _shell_ls_detail(parts: list[str]) -> str:
+    targets = [p for p in parts[1:] if not p.startswith("-")]
+    if not targets:
+        return "current dir"
+    labels = [_short_shell_path(p) for p in targets]
+    suffix = ", ..." if len(labels) > 2 else ""
+    return ", ".join(labels[:2]) + suffix
+
+
+def _shell_pytest_detail(parts: list[str]) -> str:
+    try:
+        idx = parts.index("pytest")
+    except ValueError:
+        return "pytest"
+    targets = [p for p in parts[idx + 1 :] if p and not p.startswith("-")]
+    if not targets:
+        return "all tests"
+    return ", ".join(_short_shell_path(p) for p in targets[:2])
+
+
+def _self_ops_restart_detail(command: str) -> str:
+    labels = re.findall(r"com\.babata(?:\.[A-Za-z0-9_-]+)?", command)
+    if not labels:
+        return "bot"
+    if len(labels) >= 3 and all(label.startswith("com.babata") for label in labels):
+        return "TG bots"
+    return ", ".join(labels[:2]) + (", ..." if len(labels) > 2 else "")
+
+
+def _launchctl_detail(parts: list[str], command: str) -> str:
+    action = parts[1] if len(parts) > 1 else "launchctl"
+    if "babata" in command:
+        return f"{action} babata labels"
+    label = next((p for p in parts[2:] if p.startswith("com.")), "")
+    return f"{action} {label}".strip()
+
+
+def _ps_detail(parts: list[str]) -> str:
+    if "-p" in parts:
+        idx = parts.index("-p")
+        if idx + 1 < len(parts):
+            pids = [p for p in parts[idx + 1].split(",") if p]
+            return f"{len(pids)} pids" if len(pids) > 1 else f"pid {pids[0]}"
+    return "processes"
+
+
+def _skill_name_from_text(text: str) -> str:
+    if "SKILL.md" not in text and "second-brain" not in text:
+        return ""
+    if "second-brain" in text:
+        return "second-brain"
+    parts = re.split(r"[\\/]+", text)
+    for idx, part in enumerate(parts):
+        if part == "SKILL.md" and idx > 0:
+            return parts[idx - 1]
+    return ""
+
+
+def _unwrap_shell_command(command: str) -> str:
+    command = _compact_tool_text(command, 4096)
+    if not command or command == "[secret]":
+        return command
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return command
+    if len(parts) >= 3 and Path(parts[0]).name in {"bash", "sh", "zsh"} and parts[1] in {"-c", "-lc"}:
+        return parts[2]
+    return command
+
+
+def _shell_summary(command: str) -> tuple[str, str]:
+    command = _unwrap_shell_command(command)
+    if not command or command == "[secret]":
+        return "Shell", command
+
+    if "babata-memory-context" in command or "memory-inject.sh" in command:
+        return "Memory", _memory_context_detail(command)
+    if "babata-memory-reflex" in command:
+        return "Memory", "reflex"
+    if "self-ops.sh" in command and "restart" in command:
+        return "Restart", _self_ops_restart_detail(command)
+    if re.search(r"\blaunchctl\s+", command):
+        segment = command[command.find("launchctl") :]
+        segment = re.split(r"[|;]", segment, maxsplit=1)[0]
+        return "Launchd", _launchctl_detail(_split_shell_parts(segment), command)
+    if re.search(r"\bps\s+", command):
+        segment = command[command.find("ps") :]
+        segment = re.split(r"[|;]", segment, maxsplit=1)[0]
+        return "Process", _ps_detail(_split_shell_parts(segment))
+
+    skill_name = _skill_name_from_text(command)
+    if skill_name and "SKILL.md" in command:
+        return "Skill", skill_name
+
+    if "second-brain" in command:
+        try:
+            parts = shlex.split(command)
+        except ValueError:
+            parts = command.split()
+        action = next((Path(p).name for p in parts if p.startswith("-") is False and Path(p).name != "second-brain"), "")
+        if "append-diary" in parts:
+            action = "append diary"
+        elif "read-diary" in parts:
+            action = "read diary"
+        elif "list-diaries" in parts:
+            action = "list diaries"
+        detail = "second-brain" + (f" {action}" if action else "")
+        return "Skill", detail
+
+    skill_name = _skill_name_from_text(command)
+    if skill_name:
+        return "Skill", skill_name
+
+    parts = _split_shell_parts(command)
+    if not parts:
+        return "Shell", ""
+    tool = Path(parts[0]).name
+    if tool == "find":
+        return "Find", _shell_find_detail(parts)
+    if tool == "rg":
+        return "Search", _shell_rg_detail(parts)
+    if tool == "sed":
+        return "Read", _shell_sed_detail(parts)
+    if tool == "ls":
+        return "List", _shell_ls_detail(parts)
+    if tool == "date":
+        return "Time", "now"
+    if tool in {"ha", "smart-home"}:
+        detail = " ".join(parts[1:4]).strip() or tool
+        return "Smart-home", detail
+    if tool == "launchctl":
+        return "Launchd", _launchctl_detail(parts, command)
+    if tool == "ps":
+        return "Process", _ps_detail(parts)
+    if tool == "git":
+        return "Git", " ".join(parts[1:3]).strip() or "git"
+    if tool == "pytest" or (tool in {"python", "python3"} and "-m" in parts and "pytest" in parts):
+        return "Test", _shell_pytest_detail(parts)
+    if tool in {"python", "python3", "uv", "npm", "pnpm", "yarn", "curl"}:
+        detail = " ".join([tool, *parts[1:3]]).strip()
+    else:
+        detail = tool
+    return "Shell", detail
+
+
 def _fmt_tool(name: str, inp: dict) -> str:
+    name = str(name or "")
+    inp = inp or {}
+    codex_args = _codex_args(inp)
+    merged = {**codex_args, **inp}
+    lowered = name.lower()
+
+    command = _tool_arg(merged, "command", "cmd", limit=4096)
+    if lowered in {"/bin/zsh", "/bin/bash", "/bin/sh"} or merged.get("type") == "command_execution":
+        label, detail = _shell_summary(command)
+        return _tool_line(_shell_label_icon(label), label, detail)
+
+    if "memory" in lowered or "session_search" in lowered or "ask_memory" in lowered:
+        detail = _tool_arg(merged, "query", "target", "action", "source")
+        return _tool_line("\U0001f9e0", "Memory", detail)
+
+    if lowered in {"task", "delegate_task", "spawn_agent"} or "subagent" in lowered or lowered.startswith("subagent."):
+        detail = _tool_arg(merged, "description", "goal", "task", "prompt", limit=56)
+        return _tool_line("\U0001f465", "Subagent", detail)
+
+    if lowered in {"websearch", "web_search", "search_query"} or "websearch" in lowered:
+        detail = _tool_arg(merged, "query", "q", "search_query")
+        return _tool_line("\U0001f310", "WebSearch", detail)
+
+    if lowered in {"webfetch", "web_fetch", "web_extract"}:
+        detail = _tool_arg(merged, "url", "urls")
+        return _tool_line("\U0001f310", "WebFetch", detail)
+
+    if lowered in {"skill", "skill_view", "skill_manage", "skills_list", "toolsearch", "tool_search"} or "skill" in lowered:
+        detail = _tool_arg(merged, "name", "skill", "query", "category")
+        return _tool_line("\U0001f4da", "Skill", detail)
+
+    if lowered.startswith("browser_") or lowered.startswith("chrome_") or lowered in {"open", "click", "screenshot"}:
+        detail = _tool_arg(merged, "url", "title", "selector", "ref", "path")
+        return _tool_line("\U0001f5b1\ufe0f", "Browser", detail)
+
     if name.startswith("mcp__"):
         parts = name.split("__", 2)
-        display = f"{parts[1]}/{parts[2]}" if len(parts) >= 3 else name
-        emoji = "\U0001f9e9"  # 🧩 MCP plugin
-    else:
-        display = name
-        emoji = _TOOL_EMOJI.get(name, "\U0001f527")
+        detail = f"{parts[1]}/{parts[2]}" if len(parts) >= 3 else name
+        return _tool_line("\U0001f9e9", "MCP", detail)
 
-    preview = ""
-    for key in ("command", "cmd", "query", "q", "path", "url", "text"):
-        value = inp.get(key)
-        if isinstance(value, str) and value:
-            preview = value
-            break
-    if not preview:
-        # Avoid surfacing transport/internal fields such as Codex item ids.
-        skip = {"id", "type", "status", "name"}
-        preview = next(
-            (
-                str(v)
-                for k, v in inp.items()
-                if k not in skip and isinstance(v, str) and v
-            ),
-            "",
-        )
-    preview = preview.replace("\n", " ").strip()
-    if not preview:
-        return f"{emoji} {display}"
-    if len(preview) > 40:
-        preview = preview[:40] + "..."
-    return f'{emoji} {display}: "{preview}"'
+    display = {
+        "Bash": "Shell",
+        "Read": "Read",
+        "Write": "Write",
+        "Edit": "Edit",
+        "MultiEdit": "Edit",
+        "Glob": "Files",
+        "Grep": "Search",
+        "TodoWrite": "Todo",
+        "NotebookEdit": "Notebook",
+    }.get(name, name or "Tool")
+    emoji = _TOOL_EMOJI.get(name, "\U0001f9f0")
+
+    if name == "Bash" and command:
+        label, detail = _shell_summary(command)
+        return _tool_line(_shell_label_icon(label), label, detail)
+
+    detail = _tool_arg(merged, "file_path", "path", "pattern", "query", "q", "url", "text", "name")
+    if not detail:
+        detail = _first_path_basename(json.dumps(merged, ensure_ascii=False, default=str))
+    return _tool_line(emoji, display, detail)
 
 
 def _to_html(md: str) -> str:
@@ -1142,7 +1603,11 @@ class ChannelWorker:
                 # 模式卡死 (m1+m2 合并 ResultMessage 但我们 promote m2 等不到第二
                 # turn_end). codex R3 P0 验证.
                 self._pending_payloads.append(payload)
-                if self._turn_active and interrupt_active:
+                if (
+                    self._turn_active
+                    and interrupt_active
+                    and self._session_supports_hot_input()
+                ):
                     self._spawn_interrupt()
             else:
                 self._active_reply_payload = payload
@@ -1162,6 +1627,15 @@ class ChannelWorker:
             known.extend(self._active_update_ids)
             known.extend(self._pending_update_ids)
             return update_id in known
+
+    async def has_unfinished_work(self) -> bool:
+        async with self._state_lock:
+            return (
+                self._turn_active
+                or bool(self._pending_payloads)
+                or bool(self._active_update_ids)
+                or bool(self._pending_update_ids)
+            )
 
     async def interrupt(self) -> None:
         await self.session.interrupt()
@@ -1726,17 +2200,18 @@ class ChannelWorker:
                     )
                 self._turn_recovery_attempts = 0
             finally:
-                # 只 fire 👌 给 _active_marks (= 当前 turn 的 V msgs). _pending_marks
+                # 只 fire 完成态给 _active_marks (= 当前 turn 的 V msgs). _pending_marks
                 # 是 cut-in 期间 push 的 (= 下一 turn 的 V msgs), 留着等 _begin_turn
                 # promote 进 _active_marks. SDK 真 batch 多 V msg 进一个 turn 的话,
                 # _pending_marks 在那时本就是空 (submit 只在 turn_active 才 push 到
-                # pending). 所以这里只动 active 是对的.
+                # pending). 所以这里只动 active 是对的. stopped=True 是 V 主动
+                # /stop, 不是正常完成, 要标成未完成态而不是 👌.
                 done_marks = self._active_marks
                 done_uids = self._active_update_ids
                 self._active_marks = []
                 self._active_update_ids = []
                 if done_marks:
-                    self._schedule_marks(done_marks, "👌")
+                    self._schedule_marks(done_marks, "💔" if resp.stopped else "👌")
                 for _uid in done_uids:
                     await _mark_processed(_uid)
                 self._reset_turn_state(exit_inflight=True)
@@ -3259,12 +3734,17 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # Infrastructure-touching command: fail-closed even if ALLOWED_USER==0 (开发态后门).
     if not ALLOWED_USER or not (update.effective_user and update.effective_user.id == ALLOWED_USER):
         return
-    if _current_cpu_name() != "claude":
-        await update.message.reply_text("当前 CPU 是 Codex，/stop 不支持；cut-in 会排队到当前 turn 结束后处理。")
-        return
     try:
-        await _worker().interrupt()
-        await update.message.reply_text("⏸  当前 turn 已请求中断")
+        worker = _worker()
+        cpu_name = _current_cpu_name()
+        had_work = await worker.has_unfinished_work()
+        await worker.interrupt()
+        if cpu_name == "codex" and had_work:
+            return
+        if cpu_name == "codex":
+            await update.message.reply_text("当前没有正在运行的 turn")
+        else:
+            await update.message.reply_text("⏸  当前 turn 已请求中断")
     except Exception as e:
         await update.message.reply_text(f"/stop 失败: {type(e).__name__}: {e}")
 
@@ -3476,6 +3956,42 @@ async def _run_cc_router_codex(slot: str) -> tuple[int, str]:
         return 2, f"/provider codex 失败: {type(e).__name__}: {e}"
 
 
+async def _run_cc_router_codex_add_relay(base_url: str, api_key: str) -> tuple[int, str]:
+    """Register a new relay-mode codex slot. Slot name auto-derived from URL host."""
+    if not _CC_ROUTER_CLI:
+        return 2, "/provider 未配置 (需要 BABATA_CC_ROUTER_DIR env)"
+    try:
+        result = await asyncio.to_thread(
+            subprocess.run,
+            [_CC_ROUTER_CLI, "codex", "add-relay", base_url, api_key],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        body = (result.stdout + result.stderr).strip() or "(no output)"
+        return result.returncode, body
+    except subprocess.TimeoutExpired:
+        return 124, "add-relay 超时 (15s)"
+    except Exception as e:
+        return 2, f"add-relay 失败: {type(e).__name__}: {e}"
+
+
+def _codex_main_menu_markup(current_key: str):
+    """Inline keyboard for the codex /provider main view. Reused on entry and
+    on back-button so the menu looks identical regardless of how V got there."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    choices = _codex_choices()
+    buttons = [
+        [InlineKeyboardButton(
+            f"{'● ' if key == current_key else '○ '}{name}",
+            callback_data=f"codex:{key}",
+        )]
+        for name, key in choices
+    ]
+    buttons.append([InlineKeyboardButton("➕ 新增", callback_data="codex_add:menu")])
+    return InlineKeyboardMarkup(buttons)
+
+
 async def cmd_provider(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """切换 Anthropic 渠道.
 
@@ -3504,21 +4020,15 @@ async def cmd_provider(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             return
         current_key = _current_codex_key()
         current_label = _current_codex_label()
-        choices = _codex_choices()
-        if not choices:
+        if not _codex_choices():
             await update.message.reply_text("⚠️ codex_accounts 未配置 (cc-router codex init 没跑过)")
             return
-        buttons = [
-            [InlineKeyboardButton(
-                f"{'● ' if key == current_key else '○ '}{name}",
-                callback_data=f"codex:{key}",
-            )]
-            for name, key in choices
-        ]
-        buttons.append([InlineKeyboardButton("➕ 添加新账号", callback_data="codex_add:click")])
+        # Entering the menu clears any half-finished relay-add state from a
+        # previous turn, so V can't accidentally treat normal chat as URL+key.
+        _ctx_user_data(ctx).pop("pending_relay_add", None)
         await update.message.reply_text(
             f"Codex 账号 (当前: {current_label}):",
-            reply_markup=InlineKeyboardMarkup(buttons),
+            reply_markup=_codex_main_menu_markup(current_key),
         )
         return
 
@@ -3585,32 +4095,146 @@ async def on_codex_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     await q.edit_message_text(f"{prefix}\n```\n{body}\n```", parse_mode="Markdown")
 
 
+def _RELAY_ADD_BACK_KEYBOARD():
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("← 返回", callback_data="codex_add:menu")]]
+    )
+
+
+def _ctx_user_data(ctx: ContextTypes.DEFAULT_TYPE) -> dict:
+    data = getattr(ctx, "user_data", None)
+    return data if isinstance(data, dict) else {}
+
+
 async def on_codex_add_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """添加新 Codex 账号 — 显示三步指南。
-    OAuth 必须在浏览器完成, 没法 in-bot 跑; 半自动也只能省第 1 步, 价值不大,
-    保持纯指南最干净。"""
+    """Dispatcher for the `codex_add:*` callbacks: menu / account (OAuth指南) /
+    relay (URL+key 引导) / back. Single handler keeps all add-flow state in one
+    place; the per-action helpers below stay tiny."""
     q = update.callback_query
     if not await _callback_allowed(q):
         return
     await q.answer()
-    text = (
-        "*添加新 Codex 账号 (3 步)*\n\n"
-        "在 terminal 跑:\n"
-        "```\n"
-        "cc-router codex <slot-name>\n"
-        "codex login\n"
-        "```\n"
-        "1. `<slot-name>` 起个简称 (如 `personal` / `work`), cc-router 会自动创建空 slot 并切过去, 同时 quit + 重开 Codex.app\n"
-        "2. `codex login` 浏览器 OAuth 选目标账号, 写入 `auth.<slot>.json`\n"
-        "3. 在已打开的 Codex.app 里用同一账号登一次 (写入 `Codex.<slot>/`)\n\n"
-        "完成后再点 /provider 应该能看到新 slot ✓ ✓"
+    data = q.data or ""
+    action = data.split(":", 1)[1] if ":" in data else ""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    if action == "back":
+        # Return to the /provider main menu — re-render in place.
+        _ctx_user_data(ctx).pop("pending_relay_add", None)
+        current_key = _current_codex_key()
+        current_label = _current_codex_label()
+        await q.edit_message_text(
+            f"Codex 账号 (当前: {current_label}):",
+            reply_markup=_codex_main_menu_markup(current_key),
+        )
+        return
+
+    if action in ("menu", "click"):
+        # `click` kept as alias so any stale buttons from older sessions still work.
+        _ctx_user_data(ctx).pop("pending_relay_add", None)
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔑 新增账号 (OAuth)", callback_data="codex_add:account")],
+            [InlineKeyboardButton("🌐 新增中转 (API key)", callback_data="codex_add:relay")],
+            [InlineKeyboardButton("← 返回", callback_data="codex_add:back")],
+        ])
+        await q.edit_message_text("选择新增类型:", reply_markup=markup)
+        return
+
+    if action == "account":
+        text = (
+            "*新增账号 (OAuth, 3 步)*\n\n"
+            "在 terminal 跑:\n"
+            "```\n"
+            "cc-router codex <slot-name>\n"
+            "codex login\n"
+            "```\n"
+            "1. `<slot-name>` 起个简称 (如 `personal` / `work`), cc-router 会自动创建空 slot 并切过去, 同时 quit + 重开 Codex.app\n"
+            "2. `codex login` 浏览器 OAuth 选目标账号, 写入 `auth.<slot>.json`\n"
+            "3. 在已打开的 Codex.app 里用同一账号登一次 (写入 `Codex.<slot>/`)\n\n"
+            "完成后再点 /provider 应该能看到新 slot ✓"
+        )
+        await q.edit_message_text(text, parse_mode="Markdown", reply_markup=_RELAY_ADD_BACK_KEYBOARD())
+        return
+
+    if action == "relay":
+        # Arm the next text message as the URL+key payload. Any reply that
+        # parses to a valid URL+key creates the slot; anything else aborts back
+        # to normal chat. State is per-(chat,user) via ptb's user_data dict.
+        # Plain text (no parse_mode) because TG legacy Markdown silently fails
+        # on common cases like italic-wrapping-parens and ` inside ( ), which
+        # used to swallow the click with no UI feedback.
+        _ctx_user_data(ctx)["pending_relay_add"] = True
+        text = (
+            "🌐 新增中转 (API key)\n\n"
+            "下一条消息发 base URL 和 API key,空格或换行分隔:\n\n"
+            "    https://www.msutools.cn sk-xxxxxx\n\n"
+            "或:\n\n"
+            "    https://www.msutools.cn\n"
+            "    sk-xxxxxx\n\n"
+            "• slot 名自动从域名取 (msutools.cn → msutools)\n"
+            "• 默认 model = gpt-5.5,wire_api = responses\n"
+            "• 完成后菜单会多一项,自己点切过去\n\n"
+            "取消: 点返回,或发别的消息(会当聊天处理,不会落 key)"
+        )
+        await q.edit_message_text(text, reply_markup=_RELAY_ADD_BACK_KEYBOARD())
+        return
+
+    # Unknown action — re-show the main menu defensively.
+    current_key = _current_codex_key()
+    current_label = _current_codex_label()
+    await q.edit_message_text(
+        f"Codex 账号 (当前: {current_label}):",
+        reply_markup=_codex_main_menu_markup(current_key),
     )
-    await q.edit_message_text(text, parse_mode="Markdown")
+
+
+def _parse_relay_add_text(text: str) -> tuple[str, str] | tuple[None, str]:
+    """Pick a URL and an API key out of free-form V input. Returns (url, key)
+    on success or (None, error_msg) on failure. Robust against pasted lines
+    with extra prose because V types fast."""
+    import re as _re
+    tokens = _re.split(r"\s+", text.strip())
+    url = next((t for t in tokens if t.startswith(("http://", "https://"))), None)
+    # API-key heuristic: sk-... is the OpenAI/relay convention. Don't accept the
+    # raw URL token as a key just because it has dashes.
+    key = next((t for t in tokens if t.startswith("sk-") and t != url), None)
+    if not url:
+        return None, "找不到 URL (要 http:// 或 https:// 开头)"
+    if not key:
+        return None, "找不到 API key (要 sk- 开头)"
+    return url, key
+
+
+async def _handle_relay_add_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Consume V's URL+key reply after `codex_add:relay` was clicked.
+    Returns True if the message was consumed (don't fall through to chat).
+    State is cleared whether parse succeeds or fails so a typo doesn't trap V."""
+    _ctx_user_data(ctx).pop("pending_relay_add", None)
+    text = (update.message.text or "").strip()
+    parsed = _parse_relay_add_text(text)
+    if parsed[0] is None:
+        await update.message.reply_text(
+            f"⚠️ 解析失败: {parsed[1]}\n再点 /provider → 新增 → 新增中转 重试。",
+        )
+        return True
+    url, key = parsed
+    rc, body = await _run_cc_router_codex_add_relay(url, key)
+    prefix = "✓ 已添加" if rc == 0 else f"⚠️ 失败 exit={rc}"
+    # cli.py output mentions the slot name + switch command in success case.
+    await update.message.reply_text(f"{prefix}\n```\n{body}\n```\n再点 /provider 即可看到并切换。", parse_mode="Markdown")
+    return True
 
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _allowed(update):
         return
+    # If V just clicked "新增中转", the next plaintext message is the URL+key
+    # payload — divert to add-relay handler so it never reaches CC as chat (key
+    # would leak into the transcript otherwise).
+    if _ctx_user_data(ctx).get("pending_relay_add"):
+        if await _handle_relay_add_input(update, ctx):
+            return
     await _process(update, ctx, update.message.text)
 
 
@@ -4123,6 +4747,9 @@ async def _process(
         await _record_pending_payload(payload)
         with suppress(Exception):
             await chat.send_action("typing")
+        if _shutdown_requested:
+            log.info("shutdown in progress; leaving update_id=%s for replay", update_id)
+            return
         await _worker().submit(payload)
     except Exception as e:
         log.error("enqueue failed: %s", e)
@@ -4144,6 +4771,7 @@ def _with_transcript(source: str, handler):
 async def _post_init(app: Application) -> None:
     global _channel_worker
     install_bot_transcript(app.bot)
+    _write_runtime_status("post_init")
     await bridge.start()
     asyncio.create_task(_heartbeat_loop(app))
     # Default context so terminal CC (no TG message yet) can push to user's TG

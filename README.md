@@ -50,7 +50,7 @@ babata doesn't touch your `~/.claude/` settings, doesn't read your OAuth keychai
 babata shares your existing logged-in CC — same skills, same settings, same OAuth. No `ANTHROPIC_API_KEY` needed. Quota / settings changes affect both.
 
 **Codex CPU** (`.env`: `BABATA_ENGINE=codex`):
-babata keeps the same TG/WeChat/sidebar transport but runs turns through `codex exec --json`. Current first cut supports query, resume within babata's own Codex state, images, MCP server wiring, and final-message streaming. Telegram `/cpu` overrides the `.env` default for that channel and persists in the channel state. Codex does not yet expose the same hot-input control path as Claude Code here, so TG cut-in messages queue until the active Codex turn ends.
+babata keeps the same TG/WeChat/sidebar transport but runs turns through `codex exec --json`. Current first cut supports query, resume within babata's own Codex state, images, MCP server wiring, `/stop`, and final-message streaming. Telegram `/cpu` overrides the `.env` default for that channel and persists in the channel state. Codex does not yet expose the same hot-input control path as Claude Code here, so ordinary TG cut-in messages queue until the active Codex turn ends; `/stop` cancels the active Codex exec turn.
 
 **Full trust** (`.env`: `BABATA_FULL_TRUST=1`):
 babata's CC subprocess runs with `cwd=$HOME` and `permission_mode=auto` (CC official auto mode, status shows "auto mode on") — can read your home, run any command without prompts for low-risk work. ⚠️ Only when `ALLOWED_USER_ID` is strictly correct, since anyone who can DM the bot effectively gets shell access.
@@ -93,8 +93,8 @@ See [`docs/persist-macos.md`](docs/persist-macos.md) — copy a plist template, 
 | `/status` | Show model, session, and tool-display state |
 | `/context` | Show Claude Code context usage; hidden on Codex |
 | `/verbose` | Tool display: hidden / flash / keep |
-| `/stop` | Interrupt Claude Code turn; hidden on Codex |
-| `/provider` | Switch Anthropic provider through optional cc-router; hidden on Codex |
+| `/stop` | Interrupt current turn |
+| `/provider` | Switch Anthropic provider or Codex account through optional cc-router |
 
 ## License
 

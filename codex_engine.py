@@ -972,9 +972,19 @@ class CodexLiveSession(CodexEngine):
         self._turn_task = asyncio.create_task(self._run_live_turn(prompt, images))
 
     async def interrupt(self) -> None:
-        # Codex exec has no stable hot-input control API here. Queue-mode cut-in
-        # is safer: ChannelWorker will submit the pending payload after turn_end.
-        return None
+        task = self._turn_task
+        if not task or task.done():
+            return
+        await self._cancel_turn()
+        await self._events.put(Event(
+            kind="turn_end",
+            response=Response(
+                content="当前 Codex turn 已停止。",
+                session_id=self._session_id or "",
+                cost=0.0,
+                stopped=True,
+            ),
+        ))
 
     async def events(self) -> AsyncIterator[Event]:
         while not self._closed:

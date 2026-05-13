@@ -707,6 +707,7 @@ class Response:
     cost: float
     tools: list[str] = field(default_factory=list)
     resume_note: str | None = None  # populated when SDK resume failed + we recovered
+    stopped: bool = False
     # Model + token accounting, from ResultMessage.model_usage (first key = actual
     # model CC used this turn). None when SDK didn't report (e.g. /new shortcut).
     model: str | None = None
