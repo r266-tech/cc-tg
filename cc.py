@@ -54,6 +54,7 @@ from constants import (
     SKILL_HOOKS_DIR as _SKILL_HOOKS_DIR,
     STATE_DIR as _STATE_DIR,
 )
+from skill_evolve_nudge import notify_skill_evolve_turn
 
 VENV_PYTHON = str(Path(__file__).parent / ".venv" / "bin" / "python")
 
@@ -1393,6 +1394,14 @@ class CC:
                 self._fire_hook(_HOOKS_DIR, "session-start.sh", sid)
             self._session_id = sid
             self._record_sid(sid)
+            notify_skill_evolve_turn(
+                session_id=sid,
+                cpu="claude",
+                source=_memory_source_from_prompt(self._source_prompt),
+                channel=_channel_label_from_state_file(self._state_file),
+                state_file=self._state_file,
+                metadata={"tools": tools_seen, "engine": "claude"},
+            )
 
         return Response(
             content=content,
@@ -1875,6 +1884,14 @@ class LiveSession(CC):
                 changed = (old_sid, sid)
             self._session_id = sid
             self._record_sid(sid)
+            notify_skill_evolve_turn(
+                session_id=sid,
+                cpu="claude",
+                source=_memory_source_from_prompt(self._source_prompt),
+                channel=_channel_label_from_state_file(self._state_file),
+                state_file=self._state_file,
+                metadata={"tools": tools_seen, "engine": "claude-live"},
+            )
         return response, changed
 
     @staticmethod

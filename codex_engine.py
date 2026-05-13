@@ -22,7 +22,8 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 from constants import HOOKS_DIR as _HOOKS_DIR
-from cc import CC, Event, Response, StreamCB
+from cc import CC, Event, Response, StreamCB, _memory_source_from_prompt
+from skill_evolve_nudge import notify_skill_evolve_turn
 
 log = logging.getLogger(__name__)
 
@@ -521,6 +522,14 @@ class CodexEngine(CC):
                 self._record_codex_turn(sid, prompt, content)
                 if memory_injected:
                     self._mark_codex_memory_injected(sid)
+                notify_skill_evolve_turn(
+                    session_id=sid,
+                    cpu="codex",
+                    source=_memory_source_from_prompt(self._source_prompt),
+                    channel=self._channel_label(),
+                    state_file=self._state_file,
+                    metadata={"tools": result["tools"], "engine": "codex"},
+                )
             _log_memory_reflex_post_answer(self._memory_reflex_event_id, content)
             self._memory_reflex_event_id = None
 
