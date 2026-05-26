@@ -1,5 +1,6 @@
 # babata
 
+
 Your Claude Code, on Telegram.
 
 babata is a thin transport layer that lets you talk to Claude Code from any phone, any client. Same CC binary, same skills, same memory — just a different wire.
@@ -81,3 +82,10 @@ See [`docs/persist-macos.md`](docs/persist-macos.md) — copy a plist template, 
 ## License
 
 MIT
+
+---
+
+<!-- babata-star-callout-v2 -->
+## If this saved you time
+
+Starring the repo helps me prioritize which integrations to keep maintained. This project is part of [babata](https://github.com/r266-tech) — a personal, macOS-native AI infrastructure stack.
